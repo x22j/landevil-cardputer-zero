@@ -1,16 +1,17 @@
 # LAN Devil -- CardputerZero build
 
+**[landevil.com](https://landevil.com)** -- try the live demo in your browser.
+
 The LAN Devil pocket network-ID tool as a CardputerZero APPLaunch app.
 Plug the Cardputer's Ethernet port into a switch port and the home screen
 shows link speed, your DHCP lease, and what you're plugged into -- switch
 name, port, VLAN, management IP -- from LLDP/CDP. Ping (live latency
 graph), ARP sweep (with MAC vendors) and a TCP port grid are one key away.
 
-Lineage: the Pi build (`~/Documents/ld`, Python + lldpd + e-paper) is the
-direct ancestor; the LLDP/CDP TLV parsing is ported from the S31 firmware
-(`landevil-s31/main/lldp_cdp.c`), extended with mgmt-address and 802.1
-port-VLAN TLVs. Here the keyboard and screen are the control plane, so the
-BLE / Wi-Fi AP control page isn't needed.
+LAN Devil started as a Raspberry Pi build (Python + lldpd + e-paper) and
+ESP32 firmware; the LLDP/CDP TLV parsing here is ported from the firmware
+and extended with mgmt-address, 802.1, 802.3 and LLDP-MED TLVs. On the
+CardputerZero the keyboard and screen are the whole interface.
 
 ![status](store/screenshots/status.png) ![dhcp](store/screenshots/dhcp.png)
 ![vlan](store/screenshots/vlan.png) ![log](store/screenshots/log.png)
@@ -36,14 +37,14 @@ The store can't assume lldpd is installed, so the app captures LLDP
 Switches announce every 30-60 s, so on a fresh plug-in you wait up to a
 minute (the status card shows a radar + 60 s bar while listening).
 
-If lldpd **is** installed (it is on your unit), the app also polls
+If lldpd **is** installed, the app also polls
 `lldpcli -f json show neighbors` every 5 s and shows that neighbor
 immediately, tagged `LLDP (lldpd)` / `cached`, until a fresh frame is seen
 on the wire. Both coexist fine: packet sockets get their own copy of each
 frame.
 
 Raw capture, the DHCP probe, VLAN watch/join and the raw ARP sweep need
-root. APPLaunch runs as the desktop user (`jstn` on this unit), so the
+root. APPLaunch runs as the desktop user, not root, so the
 launcher wrapper re-execs under passwordless `sudo` when the image allows
 it (stock images do). Without it: neighbors come from lldpd, the ARP sweep
 uses the kernel ARP table, and DHCP/VLAN say they need root.
@@ -58,40 +59,33 @@ uses the kernel ARP table, and DHCP/VLAN say they need root.
 | `vlan.py` | tagged-frame watcher (BPF + PACKET_AUXDATA), VLAN join/leave |
 | `portlog.py` | the CSV port log |
 | `ui.py` | palette, fonts, drawn icons/widgets |
-| `device.py` | framebuffer (finds `fb_st7789v`, never assumes fb0) and raw evdev keyboard -- no python3-evdev needed |
-| `assets/logo120.png`, `packaging/icon.png` | tinted from `branding/landevil-logo-concept-edited.jpeg` |
+| `device.py` | framebuffer (finds the ST7789 panel, never assumes fb0) and raw evdev keyboard -- no python3-evdev needed |
+| `assets/`, `packaging/icon.png` | logo and app icon |
 | `packaging/build_deb.py` | builds the `.deb` (uses dpkg-deb if present, otherwise writes it in pure Python) |
-| `deploy.sh` | build, scp, `apt install` on the device, restart APPLaunch |
+| `deploy.sh` | build, scp and `apt install` on a device over SSH |
 | `app-builder.json` | package + App Store listing metadata |
 | `tests/` | parser/DHCP/VLAN/log tests with synthetic frames and lldpd JSON |
 
-## Try it on your Cardputer (no store needed)
+## Install
+
+From the CardputerZero app store once it's listed. Until then, build and
+install the package over SSH from any Linux/macOS machine:
 
 ```bash
-./deploy.sh pi@<cardputer-ip>
+./deploy.sh <user>@<cardputer-host>      # builds the .deb, copies it, apt installs it
 ```
 
-Or by hand on the device: copy the folder over and run
-`sudo python3 landevil.py` (needs `python3-pil python3-numpy fonts-dejavu-core`).
+It then shows up in the launcher. To run it without installing, copy the
+folder to the device and run `sudo python3 landevil.py` (needs
+`python3-pil python3-numpy fonts-dejavu-core`).
 
 ## Develop off-device
 
 ```bash
-python3 landevil.py --preview /tmp/ld      # renders splash + 4 store screenshots
+python3 landevil.py --preview /tmp/ld      # renders the splash + all 7 screens with demo data
 cd tests && python3 -m unittest test_netdiag test_v02
+python3 packaging/build_deb.py --maintainer "Name <email>"   # -> build/landevil_<ver>_all.deb
 ```
-
-## Package / publish
-
-```bash
-python3 packaging/build_deb.py --maintainer "Your Name <you@example.com>"
-# -> build/landevil_0.2.0_all.deb   (Architecture: all -- pure Python)
-```
-
-Publishing goes through `czdev publish` (CardputerZero AppBuilder) or the
-web portal at dev.cardputer.cc. See `PUBLISH.md` for what's still to fill
-in. First release of a new app needs a short video of it running on a real
-device posted on the publish PR.
 
 ## Responsible use
 
@@ -99,3 +93,8 @@ DHCP probe, VLAN join, ARP sweep and port scan send traffic and are
 labelled as such on screen. Get an OK before running them on a network you
 don't administer. STAT and VLAN watch are passive (VLAN watch puts the port
 in promiscuous mode while it runs).
+
+## License
+
+MIT, see [LICENSE](LICENSE). LAN Devil is an independent project, not
+affiliated with M5Stack.

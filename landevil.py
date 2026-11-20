@@ -1015,6 +1015,7 @@ def preview(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     tmp = tempfile.mkdtemp()
     app = App(demo=demo_data(os.path.join(tmp, "ports.csv")))
+    app.log.display_path = lambda: "~/landevil/ports.csv"   # not the temp dir
     app.refresh()
     app.fields.update(PING="10.20.0.1", PORT="10.20.0.40")
     now = time.monotonic()
