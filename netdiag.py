@@ -170,13 +170,36 @@ def _mac(b):
     return ":".join(f"{x:02x}" for x in b)
 
 
+def _blank(proto, frame):
+    return {"proto": proto, "name": None, "port": None, "port_descr": None,
+            "vlan": None, "mgmt_ip": None, "platform": None, "chassis": None,
+            "src_mac": _mac(frame[6:12]), "poe": None, "mau": None,
+            "voice_vlan": None, "vlan_names": {}}
+
+
+# IEEE 802.3 MAU types (RFC 4836) -> (Mb/s, duplex) for the copper/fibre
+# types a switch port will realistically report.
+MAU_TYPES = {10: (10, "half"), 11: (10, "full"), 12: (10, "half"), 13: (10, "full"),
+             15: (100, "half"), 16: (100, "full"), 17: (100, "half"), 18: (100, "full"),
+             19: (100, "half"), 20: (100, "full"), 21: (1000, "half"), 22: (1000, "full"),
+             23: (1000, "half"), 24: (1000, "full"), 25: (1000, "half"), 26: (1000, "full"),
+             27: (1000, "half"), 28: (1000, "full"), 29: (1000, "half"), 30: (1000, "full")}
+
+
+def mau_text(mau):
+    """MAU tuple -> '100 FD' style text."""
+    if not mau:
+        return None
+    sp, dup = mau
+    return f"{sp // 1000}G {'FD' if dup == 'full' else 'HD'}" if sp >= 1000 else \
+        f"{sp}M {'FD' if dup == 'full' else 'HD'}"
+
+
 def parse_lldp(frame):
     """Parse an Ethernet frame carrying an LLDPDU. Returns dict or None."""
     if len(frame) < 16 or frame[12:14] != b"\x88\xcc":
         return None
-    r = {"proto": "LLDP", "name": None, "port": None, "port_descr": None,
-         "vlan": None, "mgmt_ip": None, "platform": None, "chassis": None,
-         "src_mac": _mac(frame[6:12])}
+    r = _blank("LLDP", frame)
     pos = 14
     n = len(frame)
     while pos + 2 <= n:
@@ -202,13 +225,66 @@ def parse_lldp(frame):
             alen, sub = v[0], v[1]
             if sub == 1 and alen == 5 and ln >= 6 and not r["mgmt_ip"]:
                 r["mgmt_ip"] = socket.inet_ntoa(v[2:6])
-        elif t == 127 and ln >= 6 and v[0:3] == b"\x00\x80\xc2" and v[3] == 1:
-            r["vlan"] = (v[4] << 8) | v[5]   # IEEE 802.1 Port VLAN ID
+        elif t == 127 and ln >= 4:
+            _lldp_org(r, v[0:3], v[3], v[4:])
         pos += ln
     r["name"] = r["name"] or r["chassis"]
     if not any(r[k] for k in ("name", "port", "mgmt_ip")):
         return None
     return r
+
+
+def _lldp_org(r, oui, sub, v):
+    """Organizationally-specific TLVs: 802.1, 802.3 and LLDP-MED."""
+    if oui == b"\x00\x80\xc2":                       # IEEE 802.1
+        if sub == 1 and len(v) >= 2:
+            r["vlan"] = (v[0] << 8) | v[1]                 # Port VLAN ID (native)
+        elif sub == 3 and len(v) >= 3:                     # VLAN Name
+            vid, n = (v[0] << 8) | v[1], v[2]
+            r["vlan_names"][vid] = _txt(v[3:3 + n])
+    elif oui == b"\x00\x12\x0f":                     # IEEE 802.3
+        if sub == 1 and len(v) >= 5:                       # MAC/PHY config/status
+            r["mau"] = MAU_TYPES.get((v[3] << 8) | v[4])
+        elif sub == 2 and len(v) >= 3:                     # Power via MDI
+            poe = r["poe"] or {}
+            poe["supported"] = bool(v[0] & 0x02)
+            poe["enabled"] = bool(v[0] & 0x04)
+            poe["pse"] = bool(v[0] & 0x01)
+            if v[2]:
+                poe["class"] = v[2] - 1
+            if len(v) >= 8:                                 # 802.3at extension
+                poe["type"] = 1 if v[3] & 0x80 else 2
+                poe["requested_w"] = ((v[4] << 8) | v[5]) / 10
+                poe["allocated_w"] = ((v[6] << 8) | v[7]) / 10
+            r["poe"] = poe
+    elif oui == b"\x00\x12\xbb":                     # LLDP-MED
+        if sub == 2 and len(v) >= 4 and v[0] == 1:         # Network Policy: voice
+            bits = (v[1] << 16) | (v[2] << 8) | v[3]
+            if not bits & 0x800000:                         # U (unknown) flag clear
+                r["voice_vlan"] = (bits >> 9) & 0xFFF
+        elif sub == 4 and len(v) >= 3:                     # Extended Power-via-MDI
+            poe = r["poe"] or {}
+            poe.setdefault("allocated_w", ((v[1] << 8) | v[2]) / 10)
+            poe["supported"] = True
+            r["poe"] = poe
+
+
+def poe_text(poe):
+    """Short PoE summary, or None if the switch didn't advertise power."""
+    if not poe or not (poe.get("supported") or poe.get("class") is not None
+                       or poe.get("allocated_w") or poe.get("cdp_mw")):
+        return None
+    parts = ["PoE"]
+    if poe.get("type"):
+        parts.append("802.3at" if poe["type"] == 2 else "802.3af")
+    if poe.get("class") is not None:
+        parts.append(f"class {poe['class']}")
+    w = poe.get("allocated_w") or (poe.get("cdp_mw") or poe.get("available_mw") or 0) / 1000
+    if w:
+        parts.append(f"{w:.1f}W")
+    if poe.get("enabled") is False and not w:
+        parts.append("off")
+    return " ".join(parts)
 
 
 def is_cdp(frame):
@@ -219,9 +295,7 @@ def is_cdp(frame):
 def parse_cdp(frame):
     if not is_cdp(frame):
         return None
-    r = {"proto": "CDP", "name": None, "port": None, "port_descr": None,
-         "vlan": None, "mgmt_ip": None, "platform": None, "chassis": None,
-         "src_mac": _mac(frame[6:12])}
+    r = _blank("CDP", frame)
     # 802.3 length field bounds the payload; trailing padding is ignored.
     end = min(len(frame), 14 + (frame[12] << 8 | frame[13]))
     pos = 14 + 8 + 4                          # eth + LLC/SNAP + ver/ttl/cksum
@@ -244,6 +318,15 @@ def parse_cdp(frame):
             r["vlan"] = (v[0] << 8) | v[1]
         elif t in (0x0002, 0x0016) and not r["mgmt_ip"]:
             r["mgmt_ip"] = _cdp_first_ipv4(v)
+        elif t == 0x000B and len(v) == 1:                   # Duplex
+            r["cdp_duplex"] = "full" if v[0] else "half"
+        elif t == 0x000E and len(v) >= 3:                   # Appliance (voice) VLAN
+            r["voice_vlan"] = (v[1] << 8) | v[2]
+        elif t == 0x0010 and len(v) == 2:                   # Power consumption, mW
+            r["poe"] = dict(r["poe"] or {}, cdp_mw=(v[0] << 8) | v[1], supported=True)
+        elif t == 0x001A and len(v) >= 8:                   # Power available, mW
+            r["poe"] = dict(r["poe"] or {}, available_mw=struct.unpack(">I", v[4:8])[0],
+                            supported=True)
         pos += ln
     if sw_version and not r["platform"]:
         r["platform"] = sw_version
@@ -319,9 +402,10 @@ class NeighborListener(threading.Thread):
             best = dict(a or b)
             other = b if a else None
             if other:
-                for k in ("vlan", "mgmt_ip", "platform"):
+                for k in ("vlan", "mgmt_ip", "platform", "poe", "mau", "voice_vlan"):
                     if not best.get(k) and other.get(k):
                         best[k] = other[k]
+                best["vlan_names"] = dict(other.get("vlan_names") or {}, **(best.get("vlan_names") or {}))
                 best["proto"] = "LLDP+CDP"
             best["age"] = time.monotonic() - self.heard_at if self.heard_at else None
             return best
@@ -405,8 +489,11 @@ class NeighborListener(threading.Thread):
 
 def lldpctl_neighbor(iface):
     """Neighbor from a running lldpd via `lldpcli -f json`, or None."""
-    for cmd in (["lldpcli", "-f", "json", "show", "neighbors", "ports", iface],
-                ["lldpctl", "-f", "json", iface]):
+    # Absolute paths: lldpcli lives in /usr/sbin, which isn't on a desktop
+    # user's PATH when the app runs unprivileged.
+    for cmd in (["/usr/sbin/lldpcli", "-f", "json", "show", "neighbors", "details", "ports", iface],
+                ["/usr/sbin/lldpctl", "-f", "json", iface],
+                ["lldpcli", "-f", "json", "show", "neighbors", "details", "ports", iface]):
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=4).stdout
             data = json.loads(out) if out.strip() else None
@@ -457,8 +544,8 @@ def _normalize_lldpd(data, iface):
     if not isinstance(block, dict):
         return None
     proto = (block.get("via") or "LLDP").upper()
-    r = {"proto": f"{proto} (lldpd)", "name": None, "port": None, "port_descr": None,
-         "vlan": None, "mgmt_ip": None, "platform": None, "chassis": None, "src_mac": None}
+    r = _blank(f"{proto} (lldpd)", b"\x00" * 12)
+    r["src_mac"] = None
     ch = block.get("chassis")
     if isinstance(ch, list):
         ch = ch[0] if ch else None
@@ -488,9 +575,32 @@ def _normalize_lldpd(data, iface):
     if isinstance(port, dict):
         r["port"] = _t(port.get("id"))
         r["port_descr"] = _t(port.get("descr"))
+        an = port.get("auto-negotiation")
+        if isinstance(an, list):
+            an = an[0] if an else None
+        if isinstance(an, dict):
+            r["mau"] = _mau_from_text(_t(an.get("current")))
+        pw = port.get("power")
+        if isinstance(pw, list):
+            pw = pw[0] if pw else None
+        if isinstance(pw, dict):
+            r["poe"] = _lldpd_power(pw)
+    r["voice_vlan"] = _find_voice_vlan(block.get("lldp-med"))
     vlan = block.get("vlan")
     if isinstance(vlan, list):
-        vlan = vlan[0] if vlan else None
+        for v in vlan:
+            if isinstance(v, dict) and v.get("vlan-id") is not None:
+                try:
+                    vid = int(_t(v.get("vlan-id")) if isinstance(v.get("vlan-id"), (dict, list))
+                              else v.get("vlan-id"))
+                except (TypeError, ValueError):
+                    continue
+                name = v.get("value")
+                if isinstance(name, str) and name:
+                    r["vlan_names"][vid] = name
+                if v.get("pvid") in (True, "yes", "true"):
+                    r["vlan"] = vid
+        vlan = vlan[0] if vlan and r["vlan"] is None else None
     if isinstance(vlan, dict):
         vid = vlan.get("vlan-id") or _t(vlan)
         if vid is None:
@@ -504,6 +614,73 @@ def _normalize_lldpd(data, iface):
     if not any(r[k] for k in ("name", "port", "mgmt_ip")):
         return None
     return r
+
+
+def _mau_from_text(s):
+    """'100BaseTXFD - 2 pair ...' / '1000BaseTFD' -> (speed, duplex)."""
+    import re
+    m = re.match(r"\s*(\d+)(G?)Base\w*?(FD|HD)", s or "")
+    if not m:
+        return None
+    sp = int(m.group(1)) * (1000 if m.group(2) else 1)
+    return (sp, "full" if m.group(3) == "FD" else "half")
+
+
+def _num(v):
+    try:
+        return float(str(_t(v) if isinstance(v, (dict, list)) else v).split()[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _lldpd_power(pw):
+    poe = {"supported": pw.get("supported") in (True, "yes"),
+           "enabled": pw.get("enabled") in (True, "yes"),
+           "pse": "PSE" in str(_t(pw.get("device-type")) or "")}
+    cls = _t(pw.get("class"))
+    if cls:
+        digits = "".join(c for c in cls if c.isdigit())
+        if digits:
+            poe["class"] = int(digits)
+    pt = _t(pw.get("power-type"))
+    if pt and pt.strip()[:1] in "12":
+        poe["type"] = int(pt.strip()[0])
+    alloc = _num(pw.get("allocated"))
+    if alloc:
+        poe["allocated_w"] = alloc / 1000 if alloc > 100 else alloc   # lldpd reports mW
+    req = _num(pw.get("requested"))
+    if req:
+        poe["requested_w"] = req / 1000 if req > 100 else req
+    return poe
+
+
+def _find_voice_vlan(obj):
+    """Dig an LLDP-MED voice policy VLAN out of lldpd's JSON, any shape."""
+    if isinstance(obj, list):
+        for x in obj:
+            v = _find_voice_vlan(x)
+            if v:
+                return v
+    elif isinstance(obj, dict):
+        app = str(_t(obj.get("apptype")) or obj.get("apptype") or "")
+        if "voice" in app.lower() and "signal" not in app.lower():
+            vl = obj.get("vlan")
+            vid = vl.get("vid") if isinstance(vl, dict) else vl
+            n = _num(vid)
+            if n:
+                return int(n)
+        for x in obj.values():
+            v = _find_voice_vlan(x)
+            if v:
+                return v
+    return None
+
+
+def carrier_changes(iface):
+    """Kernel count of carrier transitions since boot (catches flaps that
+    happen between our polls)."""
+    v = _sysfs(iface, "carrier_changes")
+    return int(v) if v and v.isdigit() else None
 
 
 # ---------------------------------------------------------------------------

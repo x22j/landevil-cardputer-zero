@@ -3,18 +3,17 @@
 LAN Devil for CardputerZero.
 
 Plug the Cardputer's Ethernet port into a switch: the home screen shows
-link speed, your DHCP lease, and what you're plugged into (switch name,
-port, VLAN, mgmt IP) from LLDP/CDP. Ping (with a live RTT graph), ARP
-sweep and a TCP port grid are one key away. Same tool as the Pi and S31
-builds; here the keyboard and screen are the control plane, so there's
-no BLE or Wi-Fi AP.
+link speed, flaps, your DHCP lease, and what you're plugged into (switch,
+port, VLAN, voice VLAN, PoE, mgmt IP) from LLDP/CDP. Tabs for a DHCP
+rogue-server probe, trunk VLAN discovery + join, ping with a live RTT
+graph, ARP sweep, a TCP port grid, and a CSV log of every port you visit.
 
-Keys:  Left/Right or Tab  switch screen    Up/Down  scroll
+Keys:  Left/Right or Tab  switch screen    Up/Down  scroll / select
        Enter              run              Esc      cancel / back
        hold Esc           exit to launcher
 
-  landevil.py                 run on the device (APPLaunch starts it as root)
-  landevil.py --preview DIR   render store screenshots with demo data (no device)
+  landevil.py                 run on the device (APPLaunch starts it via sudo)
+  landevil.py --preview DIR   render screenshots with demo data (no device)
 """
 
 import argparse
@@ -23,162 +22,40 @@ import signal
 import sys
 import threading
 import time
-import zlib
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import dhcp  # noqa: E402
 import netdiag  # noqa: E402
+import vlan  # noqa: E402
 from device import KEY, keychar  # noqa: E402
+from portlog import PortLog  # noqa: E402
+from ui import (AMBER, BG, BLUE, DIM, DKAMBER, DKGREEN, DKRED, FAINT, GREEN, H,  # noqa: E402
+                LINE, PANEL, PANEL2, RED, TEXT, W, ago, asset, badge, duration, empty,
+                fit, font, keycap, ms, nice, rj45, scrollbar, tag, vendor_color, warn_icon)
 
-VERSION = "0.1.0"
-W, H = 320, 170
-
-BG = (13, 13, 16)
-PANEL = (29, 29, 34)
-PANEL2 = (37, 37, 43)
-LINE = (56, 56, 64)
-TEXT = (236, 236, 236)
-DIM = (136, 136, 148)
-FAINT = (84, 84, 94)
-AMBER = (255, 172, 28)
-RED = (232, 64, 52)
-GREEN = (72, 208, 104)
-DKGREEN = (24, 70, 38)
-
-SCREENS = ["STAT", "PING", "ARP", "PORT"]
+VERSION = "0.2.0"
+SCREENS = ["STAT", "DHCP", "VLAN", "PING", "ARP", "PORT", "LOG"]
 LONG_PRESS = 0.8
+KEY_S, KEY_X = 31, 45
 
-# ---------------------------------------------------------------------------
-# Fonts: DejaVu from fonts-dejavu-core on the device; anything Vera-shaped
-# off-device; Pillow's built-in scalable font as the last resort.
-# ---------------------------------------------------------------------------
+LOGO_SMALL = asset("logo120.png", (15, 15))
+LOGO_BIG = asset("logo120.png", (112, 112))
 
-_FONT_DIRS = [os.path.join(HERE, "fonts"), "/usr/share/fonts/truetype/dejavu",
-              "/usr/share/fonts/TTF", "/usr/share/fonts/dejavu", "/usr/share/fonts"]
-_FONT_NAMES = {
-    "sans": ["DejaVuSans.ttf", "BitstromWeraNerdFont-Regular.ttf"],
-    "bold": ["DejaVuSans-Bold.ttf", "BitstromWeraNerdFont-Bold.ttf"],
-    "mono": ["DejaVuSansMono.ttf", "BitstromWeraNerdFontMono-Regular.ttf"],
-    "monob": ["DejaVuSansMono-Bold.ttf", "BitstromWeraNerdFontMono-Bold.ttf"],
+HOST_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
+FIELD_RULES = {                       # screen -> (allowed(c), max length)
+    "PING": (lambda c: c in HOST_CHARS, 63),
+    "PORT": (lambda c: c in HOST_CHARS, 63),
+    "VLAN": (lambda c: c.isdigit(), 4),
+    "LOG": (lambda c: c.isprintable(), 40),
 }
-_font_cache = {}
-
-
-def font(kind, size):
-    key = (kind, size)
-    if key not in _font_cache:
-        f = None
-        for d in _FONT_DIRS:
-            for n in _FONT_NAMES[kind]:
-                p = os.path.join(d, n)
-                if os.path.exists(p):
-                    f = ImageFont.truetype(p, size)
-                    break
-            if f:
-                break
-        if f is None:
-            try:
-                f = ImageFont.load_default(size)   # Pillow >= 10.1
-            except TypeError:
-                f = ImageFont.load_default()
-        _font_cache[key] = f
-    return _font_cache[key]
-
-
-_fit_cache = {}
-
-
-def fit(d, text, fnt, width):
-    """Truncate `text` with an ellipsis to fit `width` pixels (memoized:
-    text measurement dominates frame time on the CM0)."""
-    key = (str(text), id(fnt), width)
-    hit = _fit_cache.get(key)
-    if hit is not None:
-        return hit
-    text = str(text)
-    if d.textlength(text, font=fnt) > width:
-        while text and d.textlength(text + "…", font=fnt) > width:
-            text = text[:-1]
-        text += "…"
-    if len(_fit_cache) > 2000:
-        _fit_cache.clear()
-    _fit_cache[key] = text
-    return text
-
-
-def _asset(name, size=None):
-    try:
-        im = Image.open(os.path.join(HERE, "assets", name)).convert("RGB")
-        return im.resize(size, Image.LANCZOS) if size else im
-    except OSError:
-        return None
-
-
-LOGO_SMALL = _asset("logo120.png", (15, 15))
-LOGO_BIG = _asset("logo120.png", (112, 112))
 
 
 # ---------------------------------------------------------------------------
-# Little drawn icons (no glyph-coverage worries on the device font)
-# ---------------------------------------------------------------------------
-
-def tri(d, x, y, direction, size=3, fill=DIM):
-    if direction == "l":
-        pts = [(x + size, y - size), (x + size, y + size), (x, y)]
-    elif direction == "r":
-        pts = [(x, y - size), (x, y + size), (x + size, y)]
-    elif direction == "u":
-        pts = [(x - size, y + size), (x + size, y + size), (x, y)]
-    else:
-        pts = [(x - size, y), (x + size, y), (x, y + size)]
-    d.polygon(pts, fill=fill)
-
-
-def keycap(d, x, y, label, action):
-    """Footer hint: [key] action. Returns the x after it."""
-    f, fa = font("bold", 8), font("sans", 9)
-    if label in ("lr", "ud"):
-        w = 18
-    else:
-        w = int(d.textlength(label, font=f)) + 8
-    d.rounded_rectangle([x, y, x + w, y + 11], radius=3, fill=PANEL2, outline=LINE)
-    if label == "lr":
-        tri(d, x + 3, y + 5, "l", 3, TEXT)
-        tri(d, x + 11, y + 5, "r", 3, TEXT)
-    elif label == "ud":
-        tri(d, x + 5, y + 3, "u", 3, TEXT)
-        tri(d, x + 13, y + 4, "d", 3, TEXT)
-    else:
-        d.text((x + 4, y + 1), label, font=f, fill=TEXT)
-    x += w + 4
-    d.text((x, y), action, font=fa, fill=DIM)
-    return x + int(d.textlength(action, font=fa)) + 10
-
-
-def rj45(d, x, y, w, h, col):
-    """An RJ45 jack outline, used for the 'plug me in' state."""
-    d.rounded_rectangle([x, y, x + w, y + h], radius=3, outline=col, width=2)
-    pw = w // 9
-    for i in range(8):
-        px = x + 6 + i * ((w - 12) // 8)
-        d.rectangle([px, y + 5, px + pw - 1, y + 5 + h // 4], fill=col)
-    notch = w // 3
-    d.rectangle([x + notch, y + h - 2, x + w - notch, y + h + 5], outline=col, width=2)
-
-
-def vendor_color(name):
-    if not name:
-        return FAINT
-    hue = zlib.crc32(name.encode()) % 6
-    return [(255, 172, 28), (88, 170, 255), (72, 208, 104),
-            (232, 96, 200), (120, 220, 220), (232, 64, 52)][hue]
-
-
-# ---------------------------------------------------------------------------
-# Jobs: one active probe per screen, Esc cancels.
+# Jobs: background probes, streamed into job.data, Esc cancels.
 # ---------------------------------------------------------------------------
 
 class Job:
@@ -219,21 +96,47 @@ class App:
         self.iface = demo["iface"] if demo else netdiag.pick_interface()
         self.screen = 0
         self.jobs = {}
+        self.vjoin = None                  # VLAN join Job
         self.scroll = {s: 0 for s in SCREENS}
-        self.fields = {"PING": "", "PORT": ""}
+        self.fields = {k: "" for k in FIELD_RULES}
         self.shift = False
         self.esc_down = None
         self.hint_until = 0
+        self.flash = None                  # (text, colour, until)
         self.quit = False
         self.started = time.monotonic()
         self.facts = {}
         self.facts_at = 0
         self.listener = None
+        self.cc_base = None
+        self.link_changed_at = None
+        self._was_up = None
+        self.pending_auto = None           # (key, first_seen)
+        self.log = PortLog(demo.get("log_path")) if demo else PortLog()
         if not demo:
+            self.cc_base = netdiag.carrier_changes(self.iface)
             self.listener = netdiag.NeighborListener(self.iface)
             self.listener.start()
 
     # ---- data -----------------------------------------------------------
+
+    @property
+    def joined(self):
+        j = self.vjoin
+        return j.data if j and j.data.get("state") == "up" else None
+
+    @property
+    def test_iface(self):
+        """Where active probes run: the joined VLAN, else the physical port."""
+        return self.joined["iface"] if self.joined else self.iface
+
+    def flaps(self):
+        if self.demo:
+            return self.demo.get("flaps", 0)
+        cc = netdiag.carrier_changes(self.iface)
+        if cc is None or self.cc_base is None:
+            return 0
+        return max(0, cc - self.cc_base) // 2
 
     def refresh(self):
         if self.demo:
@@ -241,6 +144,9 @@ class App:
             return
         now = time.monotonic()
         link = netdiag.link_info(self.iface)
+        if self._was_up is not None and link["up"] != self._was_up:
+            self.link_changed_at = now
+        self._was_up = link["up"]
         if now - self.facts_at > 2 or link["up"] != self.facts.get("link", {}).get("up"):
             ip, prefix = netdiag.iface_ipv4(self.iface)
             self.facts = {"ip": ip, "prefix": prefix,
@@ -252,11 +158,70 @@ class App:
                 if not self.fields[k] and gw:
                     self.fields[k] = gw
         self.facts["link"] = link
+        self.auto_log(now)
 
     def neighbor(self):
         if self.demo:
             return self.demo.get("neighbor")
         return self.listener.latest()
+
+    def snapshot_row(self):
+        """What the port log records about where we're plugged in now."""
+        f, n = self.facts, self.neighbor() or {}
+        link = f.get("link", {})
+        offers = (self.jobs.get("DHCP").data.get("offers") if self.jobs.get("DHCP") else None) or []
+        return {
+            "switch": n.get("name"), "port": n.get("port"), "port_descr": n.get("port_descr"),
+            "vlan": n.get("vlan"), "voice_vlan": n.get("voice_vlan"), "mgmt_ip": n.get("mgmt_ip"),
+            "proto": n.get("proto"),
+            "link": netdiag.mau_text((link.get("speed"), link.get("duplex")))
+            if link.get("up") and link.get("speed") else ("up" if link.get("up") else "down"),
+            "switch_link": netdiag.mau_text(n.get("mau")),
+            "poe": netdiag.poe_text(n.get("poe")),
+            "ip": f"{f['ip']}/{f['prefix']}" if f.get("ip") else None,
+            "gateway": f.get("gw"),
+            "dhcp_server": " ".join(sorted({o["server"] for o in offers})) or None,
+            "flaps": self.flaps(), "platform": n.get("platform"),
+        }
+
+    def auto_log(self, now):
+        n = self.neighbor()
+        if not n or not self.facts.get("link", {}).get("up"):
+            self.pending_auto = None
+            return
+        key = (n.get("name"), n.get("port"))
+        if not self.pending_auto or self.pending_auto[0] != key:
+            self.pending_auto = (key, now)
+            return
+        # Give DHCP a moment so the row carries our IP, but don't wait forever.
+        if self.facts.get("ip") or now - self.pending_auto[1] > 15:
+            if self.log.maybe_auto(self.snapshot_row()):
+                self.say(f"logged {key[0]} {key[1]}", GREEN)
+
+    def say(self, text, col=GREEN, secs=2.5):
+        self.flash = (text, col, time.monotonic() + secs)
+
+    def alerts(self):
+        """Port-health problems worth shouting about on STAT, worst first."""
+        link = self.facts.get("link", {})
+        if not link.get("up"):
+            return []
+        out = []
+        n = self.neighbor() or {}
+        ours = (link.get("speed"), link.get("duplex"))
+        theirs = n.get("mau")
+        if not theirs and n.get("cdp_duplex") and ours[0]:
+            theirs = (ours[0], n["cdp_duplex"])
+        if theirs and ours[0] and (theirs[0] != ours[0] or theirs[1] != ours[1]):
+            out.append((RED, f"Mismatch: switch {netdiag.mau_text(theirs)}, "
+                             f"us {netdiag.mau_text(ours)}"))
+        elif ours[1] == "half":
+            out.append((RED, "Half duplex: check autonegotiation"))
+        if ours[0] == 10:
+            out.append((AMBER, "Link negotiated 10M: cable or port fault?"))
+        if self.link_changed_at and time.monotonic() - self.link_changed_at < 90 and self.flaps():
+            out.append((AMBER, f"Link flapped {ago(time.monotonic() - self.link_changed_at)}"))
+        return out
 
     # ---- input ----------------------------------------------------------
 
@@ -287,20 +252,32 @@ class App:
         elif code in (KEY["DOWN"], KEY["PAGEDOWN"]):
             self.scroll[name] += 1 if code == KEY["DOWN"] else 6
         elif code in (KEY["ENTER"], KEY["KPENTER"]):
-            if not running:
+            if name == "VLAN":
+                self.vlan_enter()
+            elif not running:
                 self.start(name)
-        elif name in self.fields and not running:
+        elif name == "VLAN" and code == KEY_S and not self.fields["VLAN"]:
+            self.start("VLAN")
+        elif name == "VLAN" and code == KEY_X:
+            self.vlan_leave()
+        elif name in self.fields and not (running and name != "VLAN"):
             if code == KEY["BACKSPACE"]:
                 self.fields[name] = self.fields[name][:-1]
             else:
                 c = keychar(code, self.shift)
-                if c and c not in " \\" and len(self.fields[name]) < 63:
+                ok, maxlen = FIELD_RULES[name]
+                if c and ok(c) and len(self.fields[name]) < maxlen:
                     self.fields[name] += c
 
     def back(self):
-        job = self.jobs.get(SCREENS[self.screen])
-        if job and job.running:
+        name = SCREENS[self.screen]
+        job = self.jobs.get(name)
+        if name == "VLAN" and self.vjoin and self.vjoin.running:
+            self.vjoin.stop.set()
+        elif job and job.running:
             job.stop.set()
+        elif name in ("VLAN", "LOG") and self.fields[name]:
+            self.fields[name] = ""
         elif self.screen != 0:
             self.screen = 0
         else:
@@ -308,21 +285,100 @@ class App:
 
     def start(self, name):
         self.scroll[name] = 0
+        ti = self.test_iface
         if name == "PING" and self.fields["PING"]:
-            self.jobs[name] = Job(netdiag.ping, self.fields["PING"], self.iface)
+            self.jobs[name] = Job(netdiag.ping, self.fields["PING"], ti)
         elif name == "ARP":
-            self.jobs[name] = Job(netdiag.arp_sweep, self.iface)
+            self.jobs[name] = Job(netdiag.arp_sweep, ti)
         elif name == "PORT" and self.fields["PORT"]:
-            self.jobs[name] = Job(netdiag.port_scan, self.fields["PORT"], self.iface)
+            self.jobs[name] = Job(netdiag.port_scan, self.fields["PORT"], ti)
+        elif name == "DHCP":
+            self.jobs[name] = Job(dhcp.probe, ti)
+        elif name == "VLAN":
+            old = self.jobs.get("VLAN")
+            if old and old.running:
+                old.stop.set()
+            self.jobs[name] = Job(vlan.sniff, self.iface)
+        elif name == "LOG":
+            row = self.snapshot_row()
+            row["label"] = self.fields["LOG"].strip() or "manual"
+            if self.log.append(row):
+                self.fields["LOG"] = ""
+                self.say("logged" + (f" {row['switch']} {row['port']}" if row["switch"] else ""))
+
+    def vlan_rows(self):
+        """Merge what we've *seen* tagged with what the switch *advertises*."""
+        job = self.jobs.get("VLAN")
+        seen = dict(job.data.get("vlans") or {}) if job else {}
+        n = self.neighbor() or {}
+        adv = {}
+        for vid, nm in (n.get("vlan_names") or {}).items():
+            adv.setdefault(vid, []).append(nm or "named")
+        if n.get("vlan"):
+            adv.setdefault(n["vlan"], []).append("native")
+        if n.get("voice_vlan"):
+            adv.setdefault(n["voice_vlan"], []).append("voice")
+        rows = []
+        for vid in sorted(set(seen) | set(adv)):
+            s = seen.get(vid)
+            rows.append({"vid": vid, "seen": s, "adv": adv.get(vid, [])})
+        return rows
+
+    def vlan_enter(self):
+        if self.vjoin and self.vjoin.running:
+            return
+        txt = self.fields["VLAN"]
+        if txt:
+            vid = int(txt)
+        else:
+            rows = self.vlan_rows()
+            if not rows:
+                self.start("VLAN")
+                return
+            vid = rows[min(self.scroll["VLAN"], len(rows) - 1)]["vid"]
+        if not 1 <= vid <= 4094:
+            self.say("VLAN ID must be 1-4094", RED)
+            return
+        if self.joined and self.joined["vid"] == vid:
+            return
+        self.vlan_leave(quiet=True)
+        self.fields["VLAN"] = ""
+        self.vjoin = Job(vlan.join, self.iface, vid)
+
+    def vlan_leave(self, quiet=False):
+        j = self.joined
+        if self.vjoin and self.vjoin.running:
+            self.vjoin.stop.set()
+        if j:
+            vlan.leave(j["iface"], j.get("ack"))
+            if not quiet:
+                self.say(f"left VLAN {j['vid']}", AMBER)
+            gw = self.facts.get("gw")
+            for k in ("PING", "PORT"):
+                if gw:
+                    self.fields[k] = gw
+        self.vjoin = None
+
+    def on_joined(self):
+        """Point Ping/Port at the VLAN's gateway once a join completes."""
+        j = self.joined
+        if j and not j.get("_announced"):
+            j["_announced"] = True
+            router = (j["ack"].get("router") or [None])[0]
+            for k in ("PING", "PORT"):
+                self.fields[k] = router or j["ack"]["yiaddr"]
+            self.say(f"on VLAN {j['vid']}: {j['ack']['yiaddr']}")
 
     def tick(self):
         """Long-press Esc detection that works even without key repeat."""
         if self.esc_down is not None and time.monotonic() - self.esc_down >= LONG_PRESS:
             self.quit = True
+        self.on_joined()
 
     def shutdown(self):
         for j in self.jobs.values():
             j.stop.set()
+        self.vlan_leave(quiet=True)       # never leave an eth0.N behind
         if self.listener:
             self.listener.stop()
 
@@ -341,28 +397,30 @@ class App:
 
     def draw_header(self, img, d):
         d.rectangle([0, 0, W, 18], fill=PANEL)
-        x = 4
         if LOGO_SMALL:
             img.paste(LOGO_SMALL, (3, 2))
-            x = 22
-        d.text((x, 2), "LAN", font=font("bold", 12), fill=TEXT)
-        d.text((x + d.textlength("LAN ", font=font("bold", 12)), 2), "DEVIL",
-               font=font("bold", 12), fill=RED)
+        tf = font("bold", 10)
+        d.text((22, 3), "LAN", font=tf, fill=TEXT)
+        d.text((22 + d.textlength("LAN ", font=tf), 3), "DEVIL", font=tf, fill=RED)
         f = font("bold", 9)
-        x = W - 4
+        x = W - 3
         for i in reversed(range(len(SCREENS))):
             label = SCREENS[i]
-            w = int(d.textlength(label, font=f)) + 10
+            if label == "VLAN" and self.joined:
+                label = f"V{self.joined['vid']}"
+            w = int(d.textlength(label, font=f)) + 9
             x -= w
-            job = self.jobs.get(label)
+            job = self.jobs.get(SCREENS[i])
+            busy = (job and job.running) or (SCREENS[i] == "VLAN" and self.vjoin and self.vjoin.running)
             if i == self.screen:
                 d.rounded_rectangle([x, 3, x + w - 2, 15], radius=3, fill=AMBER)
                 d.text((x + 4, 4), label, font=f, fill=BG)
             else:
-                d.text((x + 4, 4), label, font=f, fill=DIM)
-            if job and job.running:                  # busy dot
+                col = GREEN if label.startswith("V") and self.joined and label != "VLAN" else DIM
+                d.text((x + 4, 4), label, font=f, fill=col)
+            if busy:
                 d.ellipse([x + w - 5, 2, x + w - 1, 6], fill=GREEN if i != self.screen else BG)
-            x -= 2
+            x -= 1
         d.line([0, 18, W, 18], fill=LINE)
 
     def draw_footer(self, d):
@@ -370,17 +428,35 @@ class App:
         d.line([0, H - 16, W, H - 16], fill=LINE)
         name = SCREENS[self.screen]
         job = self.jobs.get(name)
-        if time.monotonic() < self.hint_until:
+        now = time.monotonic()
+        if now < self.hint_until:
             d.text((5, y), "Hold Esc to exit LAN Devil", font=font("bold", 9), fill=AMBER)
             return
+        if self.flash and now < self.flash[2]:
+            d.text((5, y), fit(d, self.flash[0], font("bold", 9), W - 10), font=font("bold", 9),
+                   fill=self.flash[1])
+            return
         x = 5
+        if name == "VLAN":
+            if (job and job.running) or (self.vjoin and self.vjoin.running):
+                x = keycap(d, x, y, "Esc", "stop")
+            else:
+                x = keycap(d, x, y, "S", "watch")
+            x = keycap(d, x, y, "Enter", "join")
+            if self.joined:
+                keycap(d, x, y, "X", "leave")
+            else:
+                keycap(d, x, y, "ud", "select")
+            return
         if job and job.running:
             x = keycap(d, x, y, "Esc", "stop")
         else:
             x = keycap(d, x, y, "lr", "screens")
-            if name != "STAT":
-                x = keycap(d, x, y, "Enter", "run")
-        if name == "ARP":
+            if name == "LOG":
+                x = keycap(d, x, y, "Enter", "log port")
+            elif name != "STAT":
+                x = keycap(d, x, y, "Enter", "probe" if name == "DHCP" else "run")
+        if name in ("ARP", "DHCP", "LOG"):
             keycap(d, x, y, "ud", "scroll")
         elif name == "STAT":
             keycap(d, x, y, "Esc", "hold to exit")
@@ -392,11 +468,11 @@ class App:
         link = f.get("link", {})
         up = link.get("up")
 
-        # link pill + speed ladder
+        # link pill + speed ladder + duplex
         y = 23
         pill = "LINK UP" if up else ("NO LINK" if link.get("present", True) else "NO PORT")
         pw = int(d.textlength(pill, font=font("bold", 10))) + 16
-        d.rounded_rectangle([5, y, 5 + pw, y + 15], radius=7, fill=DKGREEN if up else (70, 22, 20))
+        d.rounded_rectangle([5, y, 5 + pw, y + 15], radius=7, fill=DKGREEN if up else DKRED)
         d.ellipse([9, y + 5, 14, y + 10], fill=GREEN if up else RED)
         d.text((17, y + 2), pill, font=font("bold", 10), fill=GREEN if up else RED)
         sx = 12 + pw
@@ -404,13 +480,23 @@ class App:
         for label, val in (("10", 10), ("100", 100), ("1G", 1000)):
             lw = int(d.textlength(label, font=font("bold", 8))) + 8
             lit = up and speed >= val
-            d.rounded_rectangle([sx, y + 2, sx + lw, y + 13], radius=2,
-                                fill=AMBER if lit else PANEL, outline=None if lit else LINE)
+            fill = (RED if speed == 10 else AMBER) if lit else PANEL
+            d.rounded_rectangle([sx, y + 2, sx + lw, y + 13], radius=2, fill=fill,
+                                outline=None if lit else LINE)
             d.text((sx + 4, y + 3), label, font=font("bold", 8), fill=BG if lit else FAINT)
             sx += lw + 3
         if up and link.get("duplex"):
-            d.text((sx + 3, y + 3), link["duplex"].upper(), font=font("bold", 8), fill=DIM)
-        d.text((W - 6, y + 2), self.iface, font=font("monob", 11), fill=DIM, anchor="ra")
+            half = link["duplex"] == "half"
+            d.text((sx + 2, y + 3), "HALF" if half else "FULL", font=font("bold", 8),
+                   fill=RED if half else DIM)
+        rx = W - 6
+        d.text((rx, y + 2), self.iface, font=font("monob", 11), fill=DIM, anchor="ra")
+        rx -= int(d.textlength(self.iface, font=font("monob", 11))) + 6
+        fl = self.flaps()
+        if fl or up:
+            col = (RED if fl >= 3 else AMBER) if fl else FAINT
+            d.text((rx, y + 3), f"{fl} flap{'s' if fl != 1 else ''}", font=font("bold", 8),
+                   fill=col, anchor="ra")
 
         # address block
         y = 42
@@ -430,25 +516,27 @@ class App:
         # neighbor card
         top, bot = 66, H - 19
         n = self.neighbor()
-        accent = AMBER if n else (LINE if not up else (120, 90, 30))
+        alerts = self.alerts()
+        accent = (alerts[0][0] if alerts else AMBER) if n else (LINE if not up else (120, 90, 30))
         d.rounded_rectangle([4, top, W - 5, bot], radius=6, fill=PANEL, outline=LINE)
         d.rounded_rectangle([4, top, 8, bot], radius=2, fill=accent)
         if n:
-            self.draw_neighbor(d, n, top)
+            self.draw_neighbor(d, n, top, alerts)
         else:
-            self.draw_listening(d, top, bot, up)
+            self.draw_listening(d, top, bot, up, alerts)
 
-    def draw_neighbor(self, d, n, top):
-        tag = n["proto"]
-        tw = int(d.textlength(tag, font=font("bold", 8))) + 8
-        d.rounded_rectangle([14, top + 5, 14 + tw, top + 15], radius=3, fill=AMBER)
-        d.text((18, top + 6), tag, font=font("bold", 8), fill=BG)
+    def draw_neighbor(self, d, n, top, alerts):
+        x = tag(d, 14, top + 5, n["proto"], AMBER)
+        poe = netdiag.poe_text(n.get("poe"))
+        if poe:
+            x = tag(d, x, top + 5, poe, BLUE)
+        if n.get("voice_vlan"):
+            tag(d, x, top + 5, f"VOICE {n['voice_vlan']}", (232, 96, 200))
         age = n.get("age")
         when = "cached" if age is None else ("just now" if age < 2 else f"{int(age)}s ago")
         d.text((W - 12, top + 5), when, font=font("sans", 9), fill=DIM, anchor="ra")
         d.text((14, top + 18), fit(d, n.get("name") or "unknown", font("bold", 15), W - 30),
                font=font("bold", 15), fill=TEXT)
-        # three chips: PORT / VLAN / MGMT
         cy = top + 39
         port = n.get("port") or "?"
         chips = [("PORT", port, 110), ("VLAN", str(n["vlan"]) if n.get("vlan") else "—", 54),
@@ -460,24 +548,30 @@ class App:
             d.text((cx + 5, cy + 11), fit(d, val, font("monob", 11), cw - 13),
                    font=font("monob", 11), fill=AMBER if label == "VLAN" and val != "—" else TEXT)
             cx += cw
-        sub = n.get("platform") or n.get("port_descr")
-        if sub:
-            d.text((14, cy + 28), fit(d, sub, font("sans", 9), W - 30), font=font("sans", 9), fill=DIM)
+        if alerts:
+            col, msg = alerts[0]
+            warn_icon(d, 14, cy + 29, col, 9)
+            d.text((27, cy + 28), fit(d, msg, font("bold", 9), W - 42), font=font("bold", 9), fill=col)
+        else:
+            sub = n.get("platform") or n.get("port_descr")
+            if n.get("mau"):
+                sub = f"switch {netdiag.mau_text(n['mau'])}" + (f" · {sub}" if sub else "")
+            if sub:
+                d.text((14, cy + 28), fit(d, sub, font("sans", 9), W - 30), font=font("sans", 9), fill=DIM)
 
-    def draw_listening(self, d, top, bot, up):
+    def draw_listening(self, d, top, bot, up, alerts):
         err = None if self.demo else self.listener.error
         cx, cy = 40, (top + bot) // 2
         if not up:
             rj45(d, cx - 18, cy - 15, 36, 24, FAINT)
             d.text((74, top + 14), "Plug into a switch port", font=font("bold", 13), fill=TEXT)
-            d.text((74, top + 34), "Switch, port, VLAN & mgmt IP", font=font("sans", 10), fill=DIM)
+            d.text((74, top + 34), "Switch, port, VLAN, PoE & mgmt IP", font=font("sans", 10), fill=DIM)
             d.text((74, top + 48), "appear here from LLDP / CDP.", font=font("sans", 10), fill=DIM)
             return
         if err:
             d.text((20, top + 12), "Neighbor capture unavailable", font=font("bold", 12), fill=RED)
             d.text((20, top + 32), fit(d, err, font("mono", 10), W - 40), font=font("mono", 10), fill=DIM)
             return
-        # radar pulse
         t = time.monotonic()
         for k in range(3):
             ph = ((t * 0.8) + k / 3) % 1.0
@@ -488,8 +582,11 @@ class App:
         since = self.listener.listen_since if self.listener else self.started
         waited = time.monotonic() - since
         d.text((74, top + 12), "Listening for LLDP / CDP", font=font("bold", 13), fill=AMBER)
-        d.text((74, top + 32), "Switches announce every 30-60s.", font=font("sans", 10), fill=DIM)
-        # 60 s progress bar
+        if alerts:
+            col, msg = alerts[0]
+            d.text((74, top + 32), fit(d, msg, font("bold", 9), W - 88), font=font("bold", 9), fill=col)
+        else:
+            d.text((74, top + 32), "Switches announce every 30-60s.", font=font("sans", 10), fill=DIM)
         bx0, bx1, by = 74, W - 14, top + 52
         d.rounded_rectangle([bx0, by, bx1, by + 6], radius=3, fill=PANEL2)
         frac = min(1.0, waited / 60)
@@ -499,17 +596,17 @@ class App:
         msg = f"{int(waited)}s" if waited < 60 else f"{int(waited)}s · unmanaged switch?"
         d.text((74, by + 9), msg, font=font("sans", 9), fill=DIM)
 
-    def kv(self, d, x, y, k, v, width):
+    def kv(self, d, x, y, k, v, width, kw=22):
         d.text((x, y + 2), k, font=font("bold", 7), fill=DIM)
-        d.text((x + 22, y), fit(d, v, font("mono", 10), width - 22), font=font("mono", 10), fill=TEXT)
+        d.text((x + kw, y), fit(d, v, font("mono", 10), width - kw), font=font("mono", 10), fill=TEXT)
 
     # ---- shared: target field ------------------------------------------
 
-    def draw_field(self, d, name, label, right_w=0):
+    def draw_field(self, d, name, label, right_w=0, x_left=6, locked=None):
         job = self.jobs.get(name)
-        running = job is not None and job.running
-        d.text((6, 25), label, font=font("bold", 10), fill=DIM)
-        x0 = 8 + int(d.textlength(label, font=font("bold", 10))) + 4
+        running = (job is not None and job.running) if locked is None else locked
+        d.text((x_left, 25), label, font=font("bold", 10), fill=DIM)
+        x0 = x_left + 2 + int(d.textlength(label, font=font("bold", 10))) + 4
         x1 = W - 6 - right_w
         d.rounded_rectangle([x0, 22, x1, 39], radius=4, fill=PANEL,
                             outline=LINE if running else AMBER)
@@ -519,31 +616,182 @@ class App:
             cx = x0 + 6 + d.textlength(txt, font=font("monob", 12))
             d.rectangle([cx, 25, cx + 1, 36], fill=AMBER)
 
-    def empty(self, d, title, lines, warn=None, top=50):
-        d.text((W // 2, top), title, font=font("bold", 12), fill=TEXT, anchor="ma")
-        y = top + 19
-        for line in lines:
-            d.text((W // 2, y), line, font=font("sans", 10), fill=DIM, anchor="ma")
-            y += 14
-        if warn:
-            d.text((W // 2, y + 4), warn, font=font("bold", 9), fill=AMBER, anchor="ma")
+    def iface_note(self, d, y=25):
+        """Small right-aligned 'on eth0.20' when probes run on a joined VLAN."""
+        if self.joined:
+            badge(d, W - 6, y, f"on VLAN {self.joined['vid']}", DKGREEN, GREEN, 8)
+
+    # ---- DHCP -----------------------------------------------------------
+
+    def draw_dhcp(self, d):
+        job = self.jobs.get("DHCP")
+        d.text((6, 23), "DHCP servers", font=font("bold", 11), fill=TEXT)
+        d.text((92, 25), f"on {job.data.get('iface') if job else self.test_iface}",
+               font=font("mono", 9), fill=DIM)
+        if not job:
+            empty(d, "Who answers DHCP here?",
+                  ["Broadcasts a DHCP discover and lists every",
+                   "server that offers an address. Two or more",
+                   "servers = a rogue or misconfigured relay."],
+                  warn="Sends one discover · no lease is taken", top=44)
+            return
+        offers = job.data.get("offers") or []
+        servers = sorted({o["server"] for o in offers})
+        if job.running:
+            el = time.monotonic() - job.data.get("started", job.started)
+            d.rounded_rectangle([6, 39, W - 6, 43], radius=2, fill=PANEL2)
+            d.rounded_rectangle([6, 39, 6 + int((W - 12) * min(1, el / 4)), 43], radius=2, fill=AMBER)
+            badge(d, W - 6, 22, f"{len(servers)} found", PANEL2, DIM)
+        elif not offers:
+            badge(d, W - 6, 22, "none", DKRED, RED)
+            msg = job.last() or "No DHCP server answered."
+            d.text((W // 2, 82), fit(d, msg, font("bold", 11), W - 20), font=font("bold", 11),
+                   fill=RED, anchor="ma")
+            d.text((W // 2, 100), "Static-only network, or DHCP blocked on this VLAN.",
+                   font=font("sans", 9), fill=DIM, anchor="ma")
+            return
+        elif len(servers) == 1:
+            badge(d, W - 6, 22, "1 server", DKGREEN, GREEN)
+        else:
+            badge(d, W - 6, 22, f"{len(servers)} SERVERS", RED, BG)
+        if not offers:
+            d.text((W // 2, 80), "listening for offers…", font=font("sans", 10), fill=DIM, anchor="ma")
+            return
+        rows = []
+        rogue = len(servers) > 1
+        for i, o in enumerate(offers):
+            rows.append(("head", i, o))
+            rows.append(("kv", [("OFFER", f"{o['yiaddr']}/{o['prefix'] or '?'}"),
+                                ("GW", ", ".join(o["router"]) or "—")]))
+            rows.append(("kv", [("DNS", ", ".join(o["dns"][:2]) or "—"),
+                                ("LEASE", duration(o["lease"]) if o.get("lease") else "—")]))
+            extra = []
+            if o.get("domain"):
+                extra.append(("DOMAIN", o["domain"]))
+            if o.get("tftp") or o.get("bootfile"):
+                extra.append(("BOOT", " ".join(x for x in (o.get("tftp"), o.get("bootfile")) if x)))
+            if o.get("giaddr") and o["giaddr"] != "0.0.0.0":
+                extra.append(("RELAY", o["giaddr"]))
+            for k in range(0, len(extra), 2):
+                rows.append(("kv", extra[k:k + 2]))
+        top = 46 if rogue else 44
+        if rogue:
+            d.rounded_rectangle([4, 40, W - 5, 54], radius=4, fill=DKRED)
+            warn_icon(d, 9, 42, RED, 10)
+            d.text((24, 41), "More than one DHCP server: possible rogue", font=font("bold", 9), fill=RED)
+            top = 58
+        lh = 12
+        nrows = (H - 18 - top) // lh
+        self.scroll["DHCP"] = min(self.scroll["DHCP"], max(0, len(rows) - nrows))
+        start = self.scroll["DHCP"]
+        for i, row in enumerate(rows[start:start + nrows]):
+            y = top + i * lh
+            if row[0] == "head":
+                _, idx, o = row
+                col = (RED if rogue and idx > 0 else AMBER) if rogue else GREEN
+                x = tag(d, 6, y + 1, f"#{idx + 1}", col)
+                d.text((x, y), o["server"], font=font("monob", 10), fill=TEXT)
+                d.text((x + 6 + d.textlength(o["server"], font=font("monob", 10)), y + 1),
+                       o["src_mac"], font=font("mono", 9), fill=DIM)
+            else:
+                xs = [14, 168]
+                for (k, v), x in zip(row[1], xs):
+                    self.kv(d, x, y, k, v, (W - 20 - x) if x == 168 or len(row[1]) == 1 else 150, kw=34)
+        scrollbar(d, top, nrows, len(rows), start, lh)
+
+    # ---- VLAN -----------------------------------------------------------
+
+    def draw_vlan(self, d):
+        job = self.jobs.get("VLAN")
+        self.draw_field(d, "VLAN", "JOIN VID", right_w=W - 132, locked=False)
+        if job:
+            el = time.monotonic() - job.data.get("started", job.started)
+            txt = (f"watching {int(el)}s · {job.data.get('frames', 0)} tagged" if job.running
+                   else f"{job.data.get('frames', 0)} tagged frames")
+            d.text((W - 6, 26), txt, font=font("sans", 9), fill=GREEN if job.running else DIM, anchor="ra")
+        else:
+            d.text((W - 6, 26), "or S to watch tags", font=font("sans", 9), fill=FAINT, anchor="ra")
+        y = 42
+        jd = self.vjoin.data if self.vjoin else None
+        if jd:
+            st = jd.get("state")
+            if st == "up":
+                ack = jd["ack"]
+                fill, col = DKGREEN, GREEN
+                msg = (f"On VLAN {jd['vid']} · {ack['yiaddr']}/{ack['prefix']} · gw "
+                       f"{(ack.get('router') or ['—'])[0]}")
+            elif st == "failed":
+                fill, col, msg = DKRED, RED, f"VLAN {jd['vid']}: {jd.get('error')}"
+            else:
+                fill, col = DKAMBER, AMBER
+                msg = f"Joining VLAN {jd['vid']}… " + ("DHCP" if st == "dhcp" else "creating link")
+            d.rounded_rectangle([4, y, W - 5, y + 13], radius=4, fill=fill)
+            d.text((10, y + 1), fit(d, msg, font("bold", 9), W - 20), font=font("bold", 9), fill=col)
+            y += 16
+        rows = self.vlan_rows()
+        if not rows:
+            if job and job.running:
+                empty(d, "Watching for tagged frames…",
+                      ["Nothing yet. Tags only appear on trunk ports;",
+                       "an access port will stay empty."], top=y + 10)
+            else:
+                empty(d, "Find the VLANs on this port",
+                      ["S watches for 802.1Q-tagged frames (passive).",
+                       "Enter joins a VLAN: eth0.N + DHCP, then",
+                       "Ping / ARP / Port / DHCP run on it."], top=y + 6)
+            return
+        cols = [(8, "VID"), (44, "FRAMES"), (92, "HOSTS"), (130, "SUBNET / SWITCH SAYS"), (W - 34, "SEEN")]
+        for x, lab in cols:
+            d.text((x, y), lab, font=font("bold", 7), fill=FAINT)
+        y += 10
+        lh = 12
+        nrows = (H - 18 - y) // lh
+        cur = min(self.scroll["VLAN"], len(rows) - 1)
+        self.scroll["VLAN"] = cur
+        start = max(0, min(cur - nrows + 1, len(rows) - nrows)) if cur >= nrows else 0
+        joined_vid = self.joined["vid"] if self.joined else None
+        for i, r in enumerate(rows[start:start + nrows]):
+            ry = y + i * lh
+            sel = start + i == cur
+            if sel:
+                d.rounded_rectangle([4, ry - 1, W - 6, ry + lh - 2], radius=3, fill=PANEL2, outline=AMBER)
+            elif (start + i) % 2 == 0:
+                d.rectangle([4, ry - 1, W - 6, ry + lh - 2], fill=PANEL)
+            s = r["seen"]
+            vcol = GREEN if r["vid"] == joined_vid else (AMBER if s else DIM)
+            d.text((8, ry), str(r["vid"]), font=font("monob", 10), fill=vcol)
+            if s:
+                d.text((44, ry), _k(s["frames"]), font=font("mono", 9), fill=TEXT)
+                d.text((92, ry), str(len(s["macs"])), font=font("mono", 9), fill=TEXT)
+                sub = vlan.subnet_guess(s["ips"]) or ""
+                d.text((W - 34, ry), ago(time.monotonic() - s["last"]).replace(" ago", ""),
+                       font=font("mono", 9), fill=DIM)
+            else:
+                d.text((44, ry), "—", font=font("mono", 9), fill=FAINT)
+                d.text((92, ry), "—", font=font("mono", 9), fill=FAINT)
+                sub = ""
+            adv = ", ".join(r["adv"])
+            text = " · ".join(x for x in (sub, adv) if x) or ", ".join(sorted(s["kinds"])) if s else adv
+            d.text((130, ry), fit(d, text or "", font("sans", 9), W - 34 - 136), font=font("sans", 9),
+                   fill=TEXT if sub else DIM)
+        scrollbar(d, y, nrows, len(rows), start, lh)
 
     # ---- PING -----------------------------------------------------------
 
     def draw_ping(self, d):
-        self.draw_field(d, "PING", "PING")
+        self.draw_field(d, "PING", "PING", right_w=70 if self.joined else 0)
+        self.iface_note(d)
         job = self.jobs.get("PING")
         if not job:
-            self.empty(d, "Live latency graph",
-                       [f"Pings the target once a second over {self.iface},",
-                        "up to 60 times.  Hostnames use DHCP's DNS."])
+            empty(d, "Live latency graph",
+                  [f"Pings the target once a second over {self.test_iface},",
+                   "up to 60 times.  Hostnames use DHCP's DNS."])
             return
         data = job.data
         rtts = data.get("rtts") or []
         got = [r for r in rtts if r is not None]
         sent = data.get("sent", 0)
 
-        # graph
         gx0, gy0, gx1, gy1 = 6, 44, W - 6, 112
         d.rounded_rectangle([gx0, gy0, gx1, gy1], radius=4, fill=PANEL)
         if not rtts:
@@ -552,17 +800,16 @@ class App:
                    font=font("sans", 10), fill=RED if not job.running else DIM, anchor="ma")
         else:
             top = max(got) if got else 1.0
-            scale = _nice(top * 1.15)
+            scale = nice(top * 1.15)
             for frac in (0.5, 1.0):
                 yy = gy1 - 4 - int((gy1 - gy0 - 12) * frac)
                 for xx in range(gx0 + 4, gx1 - 30, 4):
                     d.point((xx, yy), fill=LINE)
-                d.text((gx1 - 4, yy - 5), _ms(scale * frac), font=font("sans", 8), fill=FAINT, anchor="ra")
+                d.text((gx1 - 4, yy - 5), ms(scale * frac), font=font("sans", 8), fill=FAINT, anchor="ra")
             bw, gap = 5, 2
             maxbars = (gx1 - gx0 - 40) // (bw + gap)
-            shown = rtts[-maxbars:]
             avg = sum(got) / len(got) if got else 0
-            for i, r in enumerate(shown):
+            for i, r in enumerate(rtts[-maxbars:]):
                 bx = gx0 + 5 + i * (bw + gap)
                 if r is None:
                     d.line([bx, gy1 - 10, bx + bw - 1, gy1 - 4], fill=RED, width=2)
@@ -572,12 +819,11 @@ class App:
                 col = GREEN if r <= avg * 1.5 or r < 2 else AMBER
                 d.rectangle([bx, gy1 - 4 - h, bx + bw - 1, gy1 - 4], fill=col)
 
-        # stat tiles
         loss = 100 * (sent - len(got)) / sent if sent else 0
         tiles = [("TARGET", data.get("ip") or data.get("target") or "—", TEXT),
                  ("RECV", f"{len(got)}/{sent}", TEXT),
                  ("LOSS", f"{loss:.0f}%", GREEN if loss == 0 else (AMBER if loss < 20 else RED)),
-                 ("AVG", _ms(sum(got) / len(got)) if got else "—", TEXT),
+                 ("AVG", ms(sum(got) / len(got)) if got else "—", TEXT),
                  ("MIN/MAX ms", f"{min(got):.1f}/{max(got):.1f}" if got else "—", TEXT)]
         widths = [84, 54, 42, 56, 72]
         x, y = 6, 116
@@ -592,21 +838,17 @@ class App:
     def draw_arp(self, d):
         job = self.jobs.get("ARP")
         if not job:
-            self.empty(d, "ARP sweep",
-                       ["One ARP request to every address in your",
-                        "subnet (capped at a /24), then lists who answered",
-                        "with MAC and vendor."],
-                       warn="Active scan · authorized networks only", top=34)
+            empty(d, "ARP sweep",
+                  ["One ARP request to every address in your",
+                   "subnet (capped at a /24), then lists who answered",
+                   f"with MAC and vendor.  Runs on {self.test_iface}."],
+                  warn="Active scan · authorized networks only", top=34)
             return
         data = job.data
         hosts = data.get("hosts") or []
         d.text((6, 23), "ARP", font=font("bold", 11), fill=TEXT)
         d.text((32, 24), data.get("net") or "", font=font("mono", 10), fill=DIM)
-        badge = f"{len(hosts)} hosts"
-        bw = int(d.textlength(badge, font=font("bold", 9))) + 10
-        d.rounded_rectangle([W - 6 - bw, 22, W - 6, 35], radius=6, fill=AMBER if hosts else PANEL2)
-        d.text((W - 6 - bw // 2, 24), badge, font=font("bold", 9), fill=BG if hosts else DIM, anchor="ma")
-
+        badge(d, W - 6, 22, f"{len(hosts)} hosts", AMBER if hosts else PANEL2, BG if hosts else DIM)
         y = 39
         if job.running:
             total, sent = data.get("total") or 1, data.get("sent", 0)
@@ -617,7 +859,6 @@ class App:
             msg = "listening for replies…" if job.running else (job.last() or "no replies")
             d.text((W // 2, y + 36), msg, font=font("sans", 10), fill=DIM, anchor="ma")
             return
-        # column header
         d.text((16, y), "IP", font=font("bold", 7), fill=FAINT)
         d.text((104, y), "MAC", font=font("bold", 7), fill=FAINT)
         d.text((214, y), "VENDOR", font=font("bold", 7), fill=FAINT)
@@ -635,11 +876,7 @@ class App:
             d.text((104, ry), mac, font=f, fill=DIM)
             d.text((214, ry), fit(d, ven or "unknown", font("sans", 9), W - 222), font=font("sans", 9),
                    fill=TEXT if ven else FAINT)
-        if len(hosts) > rows:
-            track = rows * lh
-            bar = max(8, track * rows // len(hosts))
-            pos = y + (track - bar) * start // max(1, len(hosts) - rows)
-            d.rectangle([W - 4, pos, W - 2, pos + bar], fill=LINE)
+        scrollbar(d, y, rows, len(hosts), start, lh)
 
     # ---- PORTS ----------------------------------------------------------
 
@@ -653,8 +890,7 @@ class App:
             lab = f"{n_open} open" if not job.running else f"{done}/{len(netdiag.COMMON_PORTS)}"
             d.rounded_rectangle([W - 66, 22, W - 6, 39], radius=4,
                                 fill=DKGREEN if n_open and not job.running else PANEL)
-            d.text((W - 36, 25), lab, font=font("bold", 10),
-                   fill=GREEN if n_open else DIM, anchor="ma")
+            d.text((W - 36, 25), lab, font=font("bold", 10), fill=GREEN if n_open else DIM, anchor="ma")
         if job and not state and not job.running:
             d.text((W // 2, 90), job.last() or "failed", font=font("sans", 10), fill=RED, anchor="ma")
             return
@@ -680,22 +916,52 @@ class App:
             d.text((W // 2, y0 + 4 * (th + 1) + 1), "TCP connect scan · authorized targets only",
                    font=font("bold", 8), fill=AMBER, anchor="ma")
 
+    # ---- LOG ------------------------------------------------------------
 
-def _nice(v):
-    """Round a graph ceiling up to 1/2/5 x 10^n."""
-    if v <= 0:
-        return 1.0
-    p = 10 ** int(f"{v:e}".split("e")[1])
-    for m in (1, 2, 5, 10):
-        if v <= m * p:
-            return m * p
-    return 10 * p
+    def draw_log(self, d):
+        self.draw_field(d, "LOG", "NOTE", locked=False)
+        if not self.fields["LOG"]:
+            d.text((80, 25), "e.g. Rm 214 jack B, then Enter", font=font("sans", 9), fill=FAINT)
+        rows = self.log.rows
+        y = 43
+        if self.log.error:
+            d.text((6, y), fit(d, self.log.error, font("bold", 9), W - 12), font=font("bold", 9), fill=RED)
+        else:
+            d.text((6, y), f"{len(rows)} rows · {self.log.display_path()} · auto-log on",
+                   font=font("sans", 9), fill=DIM)
+        y += 14
+        if not rows:
+            empty(d, "No ports logged yet",
+                  ["Each new switch + port you plug into is logged",
+                   "automatically. Add a note above to label it.",
+                   "Open the CSV in any spreadsheet."], top=y + 6)
+            return
+        lh = 12
+        nrows = (H - 18 - y) // lh
+        newest = rows[::-1]
+        self.scroll["LOG"] = min(self.scroll["LOG"], max(0, len(newest) - nrows))
+        start = self.scroll["LOG"]
+        for i, r in enumerate(newest[start:start + nrows]):
+            ry = y + i * lh
+            if (start + i) % 2 == 0:
+                d.rectangle([4, ry - 1, W - 6, ry + lh - 2], fill=PANEL)
+            t = (r.get("time") or "")[11:16]
+            d.text((8, ry), t, font=font("mono", 9), fill=DIM)
+            lab = r.get("label") or ""
+            x = 42
+            if lab == "auto":
+                x = tag(d, x, ry + 1, "AUTO", PANEL2, DIM, 7)
+            elif lab:
+                x = tag(d, x, ry + 1, fit(d, lab, font("bold", 7), 90), AMBER, BG, 7)
+            where = " ".join(v for v in (r.get("switch"), r.get("port")) if v) or "(no neighbor)"
+            vl = f"v{r['vlan']}" if r.get("vlan") else ""
+            d.text((W - 10, ry), vl, font=font("monob", 9), fill=AMBER, anchor="ra")
+            d.text((x, ry), fit(d, where, font("sans", 9), W - 14 - x - 30), font=font("sans", 9), fill=TEXT)
+        scrollbar(d, y, nrows, len(newest), start, lh)
 
 
-def _ms(v, prec=None):
-    if prec is None:
-        prec = 2 if v < 1 else (1 if v < 10 else 0)
-    return f"{v:.{prec}f}ms" if prec else f"{v:.0f}ms"
+def _k(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
 # ---------------------------------------------------------------------------
@@ -715,19 +981,21 @@ def splash():
 
 
 # ---------------------------------------------------------------------------
-# Preview: deterministic store screenshots with demo data
+# Preview: deterministic screenshots with demo data
 # ---------------------------------------------------------------------------
 
-def demo_data():
+def demo_data(log_path):
     return {
-        "iface": "eth0",
+        "iface": "eth0", "flaps": 1, "log_path": log_path,
         "facts": {"ip": "10.20.0.57", "prefix": 24, "gw": "10.20.0.1",
                   "dns": ["10.20.0.1", "1.1.1.1"],
                   "link": {"present": True, "up": True, "speed": 100,
-                           "duplex": "full", "mac": "b8:27:eb:4c:11:2e"}},
+                           "duplex": "full", "mac": "00:e0:a1:05:7b:9f"}},
         "neighbor": {"proto": "LLDP", "name": "sw-closet-3.example.lan",
-                     "port": "Gi1/0/24", "port_descr": None, "vlan": 20,
-                     "mgmt_ip": "10.20.0.2", "age": 14,
+                     "port": "Gi1/0/24", "port_descr": "desk 12", "vlan": 20, "voice_vlan": 30,
+                     "mgmt_ip": "10.20.0.2", "age": 14, "mau": (100, "full"),
+                     "poe": {"supported": True, "class": 4, "type": 2, "allocated_w": 25.5},
+                     "vlan_names": {20: "DATA", 30: "VOICE", 99: "MGMT"},
                      "platform": "Cisco IOS Software, C2960X Software, Version 15.2(7)E8"},
     }
 
@@ -736,22 +1004,52 @@ class _Done(Job):
     def __init__(self, data, lines=(), running=False):
         self.lines, self.data, self.running = list(lines), data, running
         self.stop = threading.Event()
+        self.started = time.monotonic()
         self._lock = threading.Lock()
 
 
 def preview(out_dir):
     import random
+    import tempfile
     random.seed(7)
     os.makedirs(out_dir, exist_ok=True)
-    app = App(demo=demo_data())
+    tmp = tempfile.mkdtemp()
+    app = App(demo=demo_data(os.path.join(tmp, "ports.csv")))
     app.refresh()
-    app.fields = {"PING": "10.20.0.1", "PORT": "10.20.0.40"}
+    app.fields.update(PING="10.20.0.1", PORT="10.20.0.40")
+    now = time.monotonic()
     shots = [("splash", splash())]
 
     app.screen = 0
     shots.append(("status", app.render()))
 
     app.screen = 1
+    o1 = {"server": "10.20.0.1", "src_mac": "00:1a:2b:3c:4d:01", "yiaddr": "10.20.0.58", "prefix": 24,
+          "router": ["10.20.0.1"], "dns": ["10.20.0.1", "1.1.1.1"], "lease": 86400,
+          "domain": "example.lan", "tftp": None, "bootfile": None, "giaddr": "0.0.0.0"}
+    o2 = {"server": "192.168.1.1", "src_mac": "74:da:38:5e:aa:10", "yiaddr": "192.168.1.104",
+          "prefix": 24, "router": ["192.168.1.1"], "dns": ["192.168.1.1"], "lease": 7200,
+          "domain": None, "tftp": None, "bootfile": None, "giaddr": "0.0.0.0"}
+    app.jobs["DHCP"] = _Done({"iface": "eth0", "offers": [o1, o2], "started": now - 5})
+    shots.append(("dhcp", app.render()))
+
+    app.screen = 2
+    def v(frames, macs, ips, last, kinds):
+        return {"frames": frames, "macs": set(range(macs)), "ips": set(ips),
+                "kinds": kinds, "first": now - 40, "last": now - last}
+    app.jobs["VLAN"] = _Done({"started": now - 42, "frames": 2918, "vlans": {
+        1: v(311, 3, [], 4, {"STP": 300, "CDP": 11}),
+        20: v(1840, 37, ["10.20.0.1", "10.20.0.11", "10.20.0.23"], 0, {"ARP": 400, "IPv4": 1440}),
+        30: v(512, 12, ["10.30.0.1", "10.30.0.20"], 1, {"ARP": 90, "IPv4": 422}),
+        99: v(155, 4, ["10.99.0.2", "10.99.0.3"], 9, {"ARP": 30, "IPv4": 125}),
+        140: v(100, 2, ["172.16.40.9"], 22, {"ARP": 100})}}, running=True)
+    app.vjoin = _Done({"vid": 30, "iface": "eth0.30", "state": "up",
+                       "ack": {"yiaddr": "10.30.0.57", "prefix": 24, "router": ["10.30.0.1"]}})
+    app.scroll["VLAN"] = 2
+    shots.append(("vlan", app.render()))
+    app.vjoin = None
+
+    app.screen = 3
     rtts = [round(random.uniform(0.45, 0.75), 3) for _ in range(38)]
     rtts[17], rtts[29] = 2.9, None
     rtts[30] = 1.4
@@ -759,7 +1057,7 @@ def preview(out_dir):
                               "rtts": rtts, "sent": len(rtts)}, running=True)
     shots.append(("ping", app.render()))
 
-    app.screen = 2
+    app.screen = 4
     hosts = [("10.20.0.1", "00:1a:2b:3c:4d:01", "Ubiquiti Inc"),
              ("10.20.0.2", "00:25:84:aa:10:3f", "Cisco Systems, Inc"),
              ("10.20.0.11", "3c:52:82:19:7e:c0", "Hewlett Packard"),
@@ -772,11 +1070,23 @@ def preview(out_dir):
     app.jobs["ARP"] = _Done({"net": "10.20.0.0/24", "total": 253, "sent": 253, "hosts": hosts})
     shots.append(("arp", app.render()))
 
-    app.screen = 3
+    app.screen = 5
     opened = {22, 80, 139, 443, 445, 5000}
     state = {p: ("open" if p in opened else "closed") for p, _ in netdiag.COMMON_PORTS}
     app.jobs["PORT"] = _Done({"target": "10.20.0.40", "ip": "10.20.0.40", "state": state})
     shots.append(("ports", app.render()))
+
+    app.screen = 6
+    base = {"vlan": 20, "proto": "LLDP", "link": "100M FD"}
+    for t, lab, sw, port, vl in [("09:12", "auto", "sw-closet-3", "Gi1/0/12", 20),
+                                 ("09:14", "Rm 210 jack A", "sw-closet-3", "Gi1/0/14", 20),
+                                 ("09:17", "auto", "sw-closet-3", "Gi1/0/17", 30),
+                                 ("09:21", "Rm 212 printer", "sw-closet-3", "Gi1/0/21", 99),
+                                 ("09:26", "auto", "sw-closet-4", "Gi2/0/3", 20),
+                                 ("09:31", "Rm 214 jack B", "sw-closet-3", "Gi1/0/24", 20)]:
+        app.log.rows.append(dict(base, time=f"2026-11-20 {t}:00", label=lab, switch=sw, port=port, vlan=vl))
+    app.fields["LOG"] = "Rm 216 jack A"
+    shots.append(("log", app.render()))
 
     for name, img in shots:
         p = os.path.join(out_dir, f"{name}.png")
@@ -809,6 +1119,7 @@ def main():
         app.quit = True
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
 
     try:
         app.refresh()
@@ -820,7 +1131,7 @@ def main():
             radar = (app.screen == 0 and app.facts.get("link", {}).get("up")
                      and not app.neighbor())
             busy = (any(j.running for j in app.jobs.values()) or app.esc_down is not None
-                    or radar)
+                    or radar or (app.vjoin and app.vjoin.running))
             for code, value in kbd.poll(0.08 if busy else 0.25):
                 app.on_key(code, value)
             app.tick()

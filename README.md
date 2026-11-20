@@ -12,19 +12,22 @@ direct ancestor; the LLDP/CDP TLV parsing is ported from the S31 firmware
 port-VLAN TLVs. Here the keyboard and screen are the control plane, so the
 BLE / Wi-Fi AP control page isn't needed.
 
-![status](store/screenshots/status.png) ![ping](store/screenshots/ping.png)
-![arp](store/screenshots/arp.png) ![ports](store/screenshots/ports.png)
+![status](store/screenshots/status.png) ![dhcp](store/screenshots/dhcp.png)
+![vlan](store/screenshots/vlan.png) ![log](store/screenshots/log.png)
+![ping](store/screenshots/ping.png) ![arp](store/screenshots/arp.png)
+![ports](store/screenshots/ports.png)
 
-## Keys
+## Screens
 
-| Key | Does |
+| Tab | What it does |
 |---|---|
-| Left / Right, Tab | switch screen (STAT, PING, ARP, PORT) |
-| Enter | run ping / sweep / scan |
-| type, Backspace | edit the target (prefilled with the gateway) |
-| Up / Down | scroll the ARP table |
-| Esc | stop the running probe, or back to STAT |
-| hold Esc (0.8 s) | exit to the launcher (red bar fills along the bottom) |
+| **STAT** | Link + speed ladder + duplex, flap counter (kernel `carrier_changes`), IP/GW/DNS. Neighbor card: switch, port, native VLAN, mgmt IP, **PoE** (802.3af/at class + watts, LLDP-MED, CDP), **voice VLAN** (LLDP-MED / CDP), and the switch's own speed/duplex. Alerts on **speed/duplex mismatch**, half duplex, 10M links and recent flaps. |
+| **DHCP** | Broadcasts one DHCPDISCOVER (no lease taken) and lists **every** server that offers: offered IP, gateway, DNS, lease, domain, TFTP/boot, relay. Two or more servers -> red **possible rogue** banner. |
+| **VLAN** | `S` watches 802.1Q-tagged frames on a trunk (passive): per VLAN frames, hosts, guessed subnet, merged with what the switch advertises (native / voice / named VLANs). `Enter` **joins** the selected (or typed) VLAN: creates `eth0.N`, gets a DHCP lease, and DHCP/Ping/ARP/Port then run on that VLAN (header shows `V30`). `X` leaves (DHCPRELEASE + link removed); exiting the app always cleans up. No default route is added, so Wi-Fi/SSH are unaffected. |
+| **PING** | Live RTT bar graph (lost = red X) + recv/loss/avg/min-max tiles. |
+| **ARP** | Subnet sweep (capped /24) with MAC vendors. |
+| **PORT** | TCP connect grid of 28 common services. |
+| **LOG** | Every new switch+port is **auto-logged**; type a note ("Rm 214 jack B") + Enter to add a labelled row. CSV at `~/landevil/ports.csv` (owned by the desktop user even though the app runs under sudo). |
 
 ## Neighbor discovery: raw capture *and* lldpd
 
@@ -39,22 +42,28 @@ immediately, tagged `LLDP (lldpd)` / `cached`, until a fresh frame is seen
 on the wire. Both coexist fine: packet sockets get their own copy of each
 frame.
 
-Raw capture and the ARP sweep need root (CAP_NET_RAW). APPLaunch runs as
-root and so do its children, so that's automatic when launched from the
-launcher; run by hand as `pi`, the status card says it needs root.
+Raw capture, the DHCP probe, VLAN watch/join and the raw ARP sweep need
+root. APPLaunch runs as the desktop user (`jstn` on this unit), so the
+launcher wrapper re-execs under passwordless `sudo` when the image allows
+it (stock images do). Without it: neighbors come from lldpd, the ARP sweep
+uses the kernel ARP table, and DHCP/VLAN say they need root.
 
 ## Files
 
 | File | What |
 |---|---|
 | `landevil.py` | UI: screens, input, rendering (Pillow), `--preview` |
-| `netdiag.py` | link/IP/gateway/DNS, LLDP/CDP parser + listener, lldpd reader, ping, ARP sweep, port scan |
+| `netdiag.py` | link/IP/gateway/DNS, LLDP/CDP parser (incl. 802.3 PoE/MAU, LLDP-MED, 802.1 VLAN names) + listener, lldpd reader, ping, ARP sweep, port scan |
+| `dhcp.py` | raw-socket DHCP: rogue probe, one-shot lease (DORA), release |
+| `vlan.py` | tagged-frame watcher (BPF + PACKET_AUXDATA), VLAN join/leave |
+| `portlog.py` | the CSV port log |
+| `ui.py` | palette, fonts, drawn icons/widgets |
 | `device.py` | framebuffer (finds `fb_st7789v`, never assumes fb0) and raw evdev keyboard -- no python3-evdev needed |
 | `assets/logo120.png`, `packaging/icon.png` | tinted from `branding/landevil-logo-concept-edited.jpeg` |
 | `packaging/build_deb.py` | builds the `.deb` (uses dpkg-deb if present, otherwise writes it in pure Python) |
 | `deploy.sh` | build, scp, `apt install` on the device, restart APPLaunch |
 | `app-builder.json` | package + App Store listing metadata |
-| `tests/test_netdiag.py` | parser tests with synthetic LLDP/CDP frames and lldpd JSON |
+| `tests/` | parser/DHCP/VLAN/log tests with synthetic frames and lldpd JSON |
 
 ## Try it on your Cardputer (no store needed)
 
@@ -69,14 +78,14 @@ Or by hand on the device: copy the folder over and run
 
 ```bash
 python3 landevil.py --preview /tmp/ld      # renders splash + 4 store screenshots
-python3 -m unittest tests/test_netdiag.py
+cd tests && python3 -m unittest test_netdiag test_v02
 ```
 
 ## Package / publish
 
 ```bash
 python3 packaging/build_deb.py --maintainer "Your Name <you@example.com>"
-# -> build/landevil_0.1.0_all.deb   (Architecture: all -- pure Python)
+# -> build/landevil_0.2.0_all.deb   (Architecture: all -- pure Python)
 ```
 
 Publishing goes through `czdev publish` (CardputerZero AppBuilder) or the
@@ -86,6 +95,7 @@ device posted on the publish PR.
 
 ## Responsible use
 
-ARP sweep and port scan send active traffic and are labelled as such on
-screen. Get an OK before running them on a network you don't administer;
-the passive status screen never transmits anything.
+DHCP probe, VLAN join, ARP sweep and port scan send traffic and are
+labelled as such on screen. Get an OK before running them on a network you
+don't administer. STAT and VLAN watch are passive (VLAN watch puts the port
+in promiscuous mode while it runs).

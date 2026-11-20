@@ -22,7 +22,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PREFIX = "usr/share/APPLaunch"
-APP_FILES = ["landevil.py", "netdiag.py", "device.py", "assets/logo120.png"]
+APP_FILES = ["landevil.py", "netdiag.py", "device.py", "ui.py", "dhcp.py", "vlan.py",
+             "portlog.py", "assets/logo120.png"]
 DEPENDS = "python3 (>= 3.9), python3-pil, python3-numpy, fonts-dejavu-core, iputils-ping, iproute2"
 
 WRAPPER = """#!/bin/sh
