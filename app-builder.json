@@ -1,0 +1,28 @@
+{
+  "package_name": "landevil",
+  "version": "0.1.0",
+  "app_name": "LAN Devil",
+  "bin_name": "landevil",
+  "description": "Pocket network ID: LLDP/CDP switch, port and VLAN, plus ping, ARP sweep and port scan",
+  "store": {
+    "summary": "Plug into a switch port: see switch, port, VLAN and mgmt IP",
+    "description": "LAN Devil turns the CardputerZero's Ethernet port into a pocket network ID tool. Plug into any switch port and the home screen shows link speed, your DHCP lease and the neighbor switch's name, port, VLAN and management IP, captured passively from LLDP and CDP (no lldpd needed; if lldpd is installed its cached neighbor shows instantly). One key away: ping with a live latency graph, an ARP sweep of the local subnet with MAC vendors, and a TCP port grid of 28 common services. The ARP sweep and port scan send active traffic; use them only on networks you are authorized to test.",
+    "categories": ["System Tools", "Security"],
+    "screenshots": [
+      "store/screenshots/status.png",
+      "store/screenshots/ping.png",
+      "store/screenshots/arp.png",
+      "store/screenshots/ports.png"
+    ],
+    "icon": "packaging/icon.png",
+    "license": "MIT",
+    "author": { "github": "", "display_name": "LAN Devil" },
+    "share_code": "LDVL",
+    "permissions": {
+      "camera": false, "microphone": false, "imu": false, "network": true,
+      "additional_hardware": false, "background_service": false,
+      "external_display": false
+    },
+    "locales": {}
+  }
+}
