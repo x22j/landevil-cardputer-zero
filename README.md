@@ -84,7 +84,7 @@ folder to the device and run `sudo python3 landevil.py` (needs
 ```bash
 python3 landevil.py --preview /tmp/ld      # renders the splash + all 7 screens with demo data
 cd tests && python3 -m unittest test_netdiag test_v02
-python3 packaging/build_deb.py --maintainer "Name <email>"   # -> build/landevil_<ver>_all.deb
+python3 packaging/build_deb.py                                # -> build/landevil_<ver>_all.deb
 ```
 
 ## Responsible use
@@ -93,6 +93,12 @@ DHCP probe, VLAN join, ARP sweep and port scan send traffic and are
 labelled as such on screen. Get an OK before running them on a network you
 don't administer. STAT and VLAN watch are passive (VLAN watch puts the port
 in promiscuous mode while it runs).
+
+## Contact
+
+- General: hello@landevil.com
+- Bugs and feature requests: [GitHub issues](https://github.com/x22j/landevil-cardputer-zero/issues)
+- Security problems: security@landevil.com (see [SECURITY.md](SECURITY.md))
 
 ## License
 

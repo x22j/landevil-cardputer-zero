@@ -6,7 +6,7 @@ Works without dpkg-deb (writes the ar/tar container itself), so it runs
 on any machine with Python 3; if dpkg-deb is present it is used instead.
 The package is Architecture: all -- it's pure Python.
 
-  python3 packaging/build_deb.py [--maintainer "Name <email>"] [--out build]
+  python3 packaging/build_deb.py [--maintainer "Name <email>"] [--out build]   (default: LAN Devil <dev@landevil.com>)
 """
 
 import argparse
@@ -133,7 +133,7 @@ def write_deb(staging, ctrl, out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--maintainer", default=os.environ.get("LANDEVIL_MAINTAINER", ""))
+    ap.add_argument("--maintainer", default=os.environ.get("LANDEVIL_MAINTAINER", "LAN Devil <dev@landevil.com>"))
     ap.add_argument("--out", default=os.path.join(ROOT, "build"))
     args = ap.parse_args()
     with open(os.path.join(ROOT, "app-builder.json")) as f:
