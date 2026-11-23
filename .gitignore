@@ -2,3 +2,7 @@ build/
 __pycache__/
 *.pyc
 PUBLISH.md
+
+# local video recordings
+*.mov
+*.mp4
