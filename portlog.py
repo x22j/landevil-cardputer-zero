@@ -21,12 +21,17 @@ FIELDS = ["time", "label", "switch", "port", "port_descr", "vlan", "voice_vlan",
 
 
 def _owner():
-    user = os.environ.get("SUDO_USER")
-    if user and os.geteuid() == 0:
+    if os.geteuid() == 0:
         try:
-            pw = pwd.getpwnam(user)
-            return pw.pw_dir, pw.pw_uid, pw.pw_gid
-        except KeyError:
+            if os.environ.get("SUDO_USER"):
+                pw = pwd.getpwnam(os.environ["SUDO_USER"])
+            elif os.environ.get("PKEXEC_UID"):          # launched via pkexec
+                pw = pwd.getpwuid(int(os.environ["PKEXEC_UID"]))
+            else:
+                pw = None
+            if pw:
+                return pw.pw_dir, pw.pw_uid, pw.pw_gid
+        except (KeyError, ValueError):
             pass
     return os.path.expanduser("~"), None, None
 

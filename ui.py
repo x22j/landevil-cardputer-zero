@@ -8,7 +8,7 @@ coverage in the device's font (arrows, warning signs, etc. are drawn).
 import os
 import zlib
 
-from PIL import Image, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 W, H = 320, 170
@@ -84,6 +84,121 @@ def fit(d, text, fnt, width):
         _fit_cache.clear()
     _fit_cache[key] = text
     return text
+
+
+# ---------------------------------------------------------------------------
+# Render scale. Screens are laid out in 320x170 units. On the Cardputer they
+# are drawn 1:1; a bigger display (the uConsole window) sets SCALE so every
+# shape and glyph is drawn at full resolution instead of upscaling pixels.
+# ---------------------------------------------------------------------------
+
+SCALE = 1
+
+
+def set_scale(s):
+    global SCALE
+    SCALE = max(1, int(s))
+
+
+def canvas():
+    """A fresh frame and something to draw on it in 320x170 units."""
+    img = Image.new("RGB", (W * SCALE, H * SCALE), BG)
+    d = ImageDraw.Draw(img)
+    return img, (d if SCALE == 1 else ScaledDraw(d, SCALE))
+
+
+_paste_cache = {}
+
+
+def paste_asset(img, name, size, xy):
+    """Paste assets/<name> at `size` (320x170 units), resampled from the
+    source file at the current scale so it stays sharp."""
+    key = (name, size, SCALE)
+    if key not in _paste_cache:
+        _paste_cache[key] = asset(name, (size[0] * SCALE, size[1] * SCALE))
+    im = _paste_cache[key]
+    if im is not None:
+        img.paste(im, (xy[0] * SCALE, xy[1] * SCALE))
+
+
+def _flat(xy):
+    out = []
+    for v in xy:
+        if isinstance(v, (tuple, list)):
+            out.extend(v)
+        else:
+            out.append(v)
+    return out
+
+
+class ScaledDraw:
+    """ImageDraw stand-in: takes 320x170 coordinates, sizes and fonts, and
+    draws them `s` times bigger. Text is re-rasterized from the TrueType
+    font at s x size, so it's crisp rather than blocky. textlength() answers
+    in 320x170 units (measured on the big font) so layout code is unchanged."""
+
+    def __init__(self, d, s):
+        self.d, self.s = d, s
+        self._fonts = {}
+
+    def _font(self, f):
+        if f is None:
+            return None
+        key = id(f)
+        if key not in self._fonts:
+            try:
+                self._fonts[key] = ImageFont.truetype(f.path, round(f.size * self.s))
+            except (AttributeError, OSError):
+                try:
+                    self._fonts[key] = f.font_variant(size=round(f.size * self.s))
+                except Exception:
+                    self._fonts[key] = f
+        return self._fonts[key]
+
+    def _box(self, xy):
+        x0, y0, x1, y1 = _flat(xy)
+        s = self.s
+        return (round(x0 * s), round(y0 * s), round(x1 * s) + s - 1, round(y1 * s) + s - 1)
+
+    def _pts(self, xy):
+        v, s, c = _flat(xy), self.s, (self.s - 1) / 2
+        return [(v[i] * s + c, v[i + 1] * s + c) for i in range(0, len(v) - 1, 2)]
+
+    def _w(self, width):
+        return max(1, width or 1) * self.s
+
+    def rectangle(self, xy, fill=None, outline=None, width=1):
+        self.d.rectangle(self._box(xy), fill=fill, outline=outline, width=self._w(width))
+
+    def rounded_rectangle(self, xy, radius=0, fill=None, outline=None, width=1, **kw):
+        self.d.rounded_rectangle(self._box(xy), radius=radius * self.s, fill=fill,
+                                 outline=outline, width=self._w(width), **kw)
+
+    def ellipse(self, xy, fill=None, outline=None, width=1):
+        self.d.ellipse(self._box(xy), fill=fill, outline=outline, width=self._w(width))
+
+    def line(self, xy, fill=None, width=0, joint=None):
+        self.d.line(self._pts(xy), fill=fill, width=self._w(width), joint=joint)
+
+    def polygon(self, xy, fill=None, outline=None, width=1):
+        self.d.polygon(self._pts(xy), fill=fill, outline=outline, width=self._w(width))
+
+    def point(self, xy, fill=None):
+        v, s = _flat(xy), self.s
+        for i in range(0, len(v) - 1, 2):
+            x, y = round(v[i] * s), round(v[i + 1] * s)
+            self.d.rectangle((x, y, x + s - 1, y + s - 1), fill=fill)
+
+    def text(self, xy, text, fill=None, font=None, anchor=None, **kw):
+        x, y = _flat(xy)[:2]
+        for k in ("spacing", "stroke_width"):
+            if k in kw:
+                kw[k] = kw[k] * self.s
+        self.d.text((x * self.s, y * self.s), text, fill=fill, font=self._font(font),
+                    anchor=anchor, **kw)
+
+    def textlength(self, text, font=None, **kw):
+        return self.d.textlength(text, font=self._font(font), **kw) / self.s
 
 
 def asset(name, size=None):

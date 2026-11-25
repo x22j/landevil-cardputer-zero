@@ -13,6 +13,8 @@ Keys:  Left/Right or Tab  switch screen    Up/Down  scroll / select
        hold Esc           exit to launcher
 
   landevil.py                 run on the device (APPLaunch starts it via sudo)
+  landevil.py --window        run fullscreen in a desktop window (uConsole)
+  landevil.py --windowed      same, in a normal window (F11 toggles fullscreen)
   landevil.py --preview DIR   render screenshots with demo data (no device)
 """
 
@@ -23,7 +25,7 @@ import sys
 import threading
 import time
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -34,16 +36,15 @@ import vlan  # noqa: E402
 from device import KEY, keychar  # noqa: E402
 from portlog import PortLog  # noqa: E402
 from ui import (AMBER, BG, BLUE, DIM, DKAMBER, DKGREEN, DKRED, FAINT, GREEN, H,  # noqa: E402
-                LINE, PANEL, PANEL2, RED, TEXT, W, ago, asset, badge, duration, empty,
-                fit, font, keycap, ms, nice, rj45, scrollbar, tag, vendor_color, warn_icon)
+                LINE, PANEL, PANEL2, RED, TEXT, W, ago, badge, canvas, duration, empty,
+                fit, font, keycap, ms, nice, paste_asset, rj45, scrollbar, set_scale, tag,
+                vendor_color, warn_icon)
 
 VERSION = "0.2.0"
 SCREENS = ["STAT", "DHCP", "VLAN", "PING", "ARP", "PORT", "LOG"]
 LONG_PRESS = 0.8
 KEY_S, KEY_X = 31, 45
 
-LOGO_SMALL = asset("logo120.png", (15, 15))
-LOGO_BIG = asset("logo120.png", (112, 112))
 
 HOST_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
 FIELD_RULES = {                       # screen -> (allowed(c), max length)
@@ -385,8 +386,7 @@ class App:
     # ---- frame ----------------------------------------------------------
 
     def render(self):
-        img = Image.new("RGB", (W, H), BG)
-        d = ImageDraw.Draw(img)
+        img, d = canvas()
         self.draw_header(img, d)
         getattr(self, "draw_" + SCREENS[self.screen].lower())(d)
         self.draw_footer(d)
@@ -397,8 +397,7 @@ class App:
 
     def draw_header(self, img, d):
         d.rectangle([0, 0, W, 18], fill=PANEL)
-        if LOGO_SMALL:
-            img.paste(LOGO_SMALL, (3, 2))
+        paste_asset(img, "logo120.png", (15, 15), (3, 2))
         tf = font("bold", 10)
         d.text((22, 3), "LAN", font=tf, fill=TEXT)
         d.text((22 + d.textlength("LAN ", font=tf), 3), "DEVIL", font=tf, fill=RED)
@@ -969,10 +968,8 @@ def _k(n):
 # ---------------------------------------------------------------------------
 
 def splash():
-    img = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(img)
-    if LOGO_BIG:
-        img.paste(LOGO_BIG, (14, (H - 112) // 2))
+    img, d = canvas()
+    paste_asset(img, "logo120.png", (112, 112), (14, (H - 112) // 2))
     x = 140
     d.text((x, 44), "LAN", font=font("bold", 30), fill=TEXT)
     d.text((x, 76), "DEVIL", font=font("bold", 30), fill=RED)
@@ -1100,20 +1097,36 @@ def preview(out_dir):
 def main():
     ap = argparse.ArgumentParser(description="LAN Devil for CardputerZero")
     ap.add_argument("--preview", metavar="DIR", help="render demo screenshots and exit")
+    ap.add_argument("--window", action="store_true",
+                    help="run in a fullscreen desktop window (uConsole) instead of the LCD")
+    ap.add_argument("--windowed", action="store_true",
+                    help="like --window, but a normal-sized window (F11 toggles fullscreen)")
+    ap.add_argument("--scale", type=int, help="window scale factor (default: fit the screen)")
     args = ap.parse_args()
     if args.preview:
         preview(args.preview)
         return 0
 
-    from device import Framebuffer, Keyboard
-    try:
-        fb = Framebuffer()
-    except (OSError, RuntimeError) as e:
-        print(f"landevil: framebuffer: {e}", file=sys.stderr)
-        return 1
+    if args.window or args.windowed:
+        try:
+            from window import Window
+            fb = kbd = Window(W, H, fullscreen=not args.windowed, scale=args.scale)
+            set_scale(fb.scale)           # draw at full resolution, not upscaled
+        except Exception as e:             # no display, no tkinter, no ImageTk
+            print(f"landevil: window: {e}", file=sys.stderr)
+            return 1
+    else:
+        from device import Framebuffer, Keyboard
+        try:
+            fb = Framebuffer()
+        except (OSError, RuntimeError) as e:
+            print(f"landevil: framebuffer: {e}", file=sys.stderr)
+            return 1
+        kbd = None
     fb.show(splash())
     shown_at = time.monotonic()
-    kbd = Keyboard()
+    if kbd is None:
+        kbd = Keyboard()
     app = App()
 
     def on_signal(*_):
@@ -1127,6 +1140,8 @@ def main():
         time.sleep(max(0, 1.2 - (time.monotonic() - shown_at)))
         kbd.poll(0)                         # drop the launcher's Enter keypress
         while not app.quit:
+            if getattr(kbd, "closed", False):     # desktop window closed
+                break
             app.refresh()
             fb.show(app.render())
             radar = (app.screen == 0 and app.facts.get("link", {}).get("up")
@@ -1142,7 +1157,8 @@ def main():
             fb.show(Image.new("RGB", (fb.w, fb.h), (0, 0, 0)))
         finally:
             fb.close()
-            kbd.close()
+            if kbd is not fb:
+                kbd.close()
     return 0
 
 

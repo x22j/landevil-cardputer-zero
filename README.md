@@ -60,8 +60,9 @@ uses the kernel ARP table, and DHCP/VLAN say they need root.
 | `portlog.py` | the CSV port log |
 | `ui.py` | palette, fonts, drawn icons/widgets |
 | `device.py` | framebuffer (finds the ST7789 panel, never assumes fb0) and raw evdev keyboard -- no python3-evdev needed |
+| `window.py` | desktop window backend for the uConsole (`--window`): Tk, scaled frame, keys mapped to the same keycodes |
 | `assets/`, `packaging/icon.png` | logo and app icon |
-| `packaging/build_deb.py` | builds the `.deb` (uses dpkg-deb if present, otherwise writes it in pure Python) |
+| `packaging/build_deb.py` | builds the `.deb` (uses dpkg-deb if present, otherwise writes it in pure Python); `--target uconsole` for the desktop package |
 | `deploy.sh` | build, scp and `apt install` on a device over SSH |
 | `app-builder.json` | package + App Store listing metadata |
 | `tests/` | parser/DHCP/VLAN/log tests with synthetic frames and lldpd JSON |
@@ -78,6 +79,26 @@ install the package over SSH from any Linux/macOS machine:
 It then shows up in the launcher. To run it without installing, copy the
 folder to the device and run `sudo python3 landevil.py` (needs
 `python3-pil python3-numpy fonts-dejavu-core`).
+
+### uConsole (and other Linux desktops)
+
+The same app runs fullscreen in a desktop window, scaled 4x to the
+uConsole's 1280x720 screen. On a uConsole with the HackerGadgets AIO V2
+board, its RJ45 port is the Compute Module's own `eth0`, which LAN Devil
+picks automatically (`LANDEVIL_IFACE=<name>` overrides).
+
+```bash
+python3 packaging/build_deb.py --target uconsole        # -> build/landevil-uconsole_<ver>_all.deb
+scp build/landevil-uconsole_*_all.deb <user>@<uconsole-host>:/tmp/
+ssh <user>@<uconsole-host> 'sudo apt-get install -y /tmp/landevil-uconsole_*_all.deb'
+```
+
+Start it from the menu (Applications > Internet / System Tools > LAN Devil)
+or run `landevil`. It re-runs itself as root (passwordless sudo, else a
+pkexec password prompt) so LLDP/CDP capture, the DHCP probe and the ARP
+sweep work. Same keys as on the Cardputer; hold Esc or close the window to
+quit, F11 toggles fullscreen. `python3 landevil.py --windowed` runs it in a
+normal window on any desktop for development.
 
 ## Develop off-device
 
