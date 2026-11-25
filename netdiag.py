@@ -28,6 +28,7 @@ import time
 ETH_P_ARP = 0x0806
 ETH_P_LLDP = 0x88CC
 ETH_P_802_2 = 0x0004          # 802.3 length-framed LLC frames (CDP rides on these)
+ETH_P_PAE = 0x888E            # 802.1X EAPOL
 SOL_PACKET = 263
 PACKET_ADD_MEMBERSHIP = 1
 PACKET_MR_MULTICAST = 0
@@ -35,6 +36,7 @@ SO_BINDTODEVICE = 25
 
 LLDP_MCAST = bytes.fromhex("0180c200000e")
 CDP_MCAST = bytes.fromhex("01000ccccccc")
+PAE_MCAST = bytes.fromhex("0180c2000003")    # 802.1X port access entity group
 
 
 def is_root():
@@ -360,6 +362,36 @@ def _cdp_first_ipv4(v):
 
 
 # ---------------------------------------------------------------------------
+# 802.1X (EAPOL). An authenticator -- the switch -- on an 802.1X port sends
+# EAP-Request/Identity to the PAE group address every ~30 s until a
+# supplicant answers. Hearing one means "this port wants you to log in":
+# the usual reason a port shows link but hands out no DHCP.
+# ---------------------------------------------------------------------------
+
+EAP_CODES = {1: "Request", 2: "Response", 3: "Success", 4: "Failure"}
+EAP_METHODS = {1: "Identity", 4: "MD5", 6: "GTC", 13: "TLS", 17: "LEAP", 21: "TTLS",
+               25: "PEAP", 26: "MSCHAPv2", 43: "FAST", 55: "TEAP"}
+EAPOL_TYPES = {0: "EAP", 1: "Start", 2: "Logoff", 3: "Key"}
+
+
+def parse_eapol(frame):
+    """{'src', 'eapol', 'code', 'method', 'prompt'} for an EAPOL frame, or None."""
+    if len(frame) < 18 or frame[12:14] != b"\x88\x8e":
+        return None
+    r = {"src": _mac(frame[6:12]), "eapol": EAPOL_TYPES.get(frame[15], str(frame[15])),
+         "code": None, "method": None, "prompt": None}
+    if frame[15] == 0 and len(frame) >= 22:
+        code, elen = frame[18], int.from_bytes(frame[20:22], "big")
+        r["code"] = EAP_CODES.get(code, str(code))
+        if code in (1, 2) and len(frame) >= 23 and elen >= 5:
+            t = frame[22]
+            r["method"] = EAP_METHODS.get(t, f"type {t}")
+            if t == 1:                     # Request/Identity may carry a prompt
+                r["prompt"] = _txt(frame[23:18 + elen]) or None
+    return r
+
+
+# ---------------------------------------------------------------------------
 # Passive neighbor listener
 # ---------------------------------------------------------------------------
 
@@ -380,10 +412,12 @@ class NeighborListener(threading.Thread):
         self.lldpd = None
         self.lldpd_at = 0
         self.heard_at = None
+        self.auth = None                   # 802.1X: what we've heard, see auth_state()
         self.listen_since = time.monotonic()
         self.error = None
         self._stop = threading.Event()
         self._was_up = False
+        self._mac = None
 
     def stop(self):
         self._stop.set()
@@ -410,16 +444,44 @@ class NeighborListener(threading.Thread):
             best["age"] = time.monotonic() - self.heard_at if self.heard_at else None
             return best
 
+    def auth_state(self):
+        """802.1X on this port: {'count', 'age', 'last', 'method', 'prompt',
+        'src', 'result'} once an authenticator has been heard, else None."""
+        with self.lock:
+            if not self.auth:
+                return None
+            return dict(self.auth, age=time.monotonic() - self.auth["last_at"])
+
+    def _on_eapol(self, frame):
+        e = parse_eapol(frame)
+        if not e or e["src"] == self._mac or e["code"] == "Response" or e["eapol"] != "EAP":
+            return                         # only what the authenticator sends us
+        now = time.monotonic()
+        with self.lock:
+            a = self.auth or {"count": 0, "first_at": now, "method": None, "prompt": None,
+                              "result": None}
+            a.update(count=a["count"] + 1, last_at=now, src=e["src"], last=e["code"])
+            if e["code"] in ("Success", "Failure"):
+                a["result"] = e["code"]
+            if e["method"] and e["method"] != "Identity":
+                a["method"] = e["method"]
+            if e["prompt"]:
+                a["prompt"] = e["prompt"]
+            self.auth = a
+
     def reset(self):
         with self.lock:
             self.lldp = self.cdp = self.lldpd = self.heard_at = None
+            self.auth = None
             self.lldpd_at = 0
             self.listen_since = time.monotonic()
 
     def _open(self):
         socks = []
         ifindex = socket.if_nametoindex(self.iface)
-        for proto, mcast in ((ETH_P_LLDP, LLDP_MCAST), (ETH_P_802_2, CDP_MCAST)):
+        self._mac = link_info(self.iface).get("mac")
+        for proto, mcast in ((ETH_P_LLDP, LLDP_MCAST), (ETH_P_802_2, CDP_MCAST),
+                             (ETH_P_PAE, PAE_MCAST)):
             s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(proto))
             s.bind((self.iface, 0))
             mreq = struct.pack("iHH8s", ifindex, PACKET_MR_MULTICAST, 6, mcast)
@@ -467,6 +529,8 @@ class NeighborListener(threading.Thread):
                         if n:
                             with self.lock:
                                 self.lldp, self.heard_at = n, time.monotonic()
+                    elif frame[12:14] == b"\x88\x8e":
+                        self._on_eapol(frame)
                     elif is_cdp(frame):
                         n = parse_cdp(frame)
                         if n:
@@ -960,3 +1024,279 @@ def port_scan(job, host, iface, timeout=0.8):
         t.start()
     for t in threads:
         t.join()
+
+
+# ---------------------------------------------------------------------------
+# NET: DNS lookup, internet / captive-portal check, traceroute. Everything
+# is pinned to the wired port (SO_BINDTODEVICE when root), so the answers
+# describe *this* port -- not Wi-Fi, not a VPN's resolver.
+# ---------------------------------------------------------------------------
+
+IP_RECVERR = 11
+NET_CHECK_HOST = "connectivitycheck.gstatic.com"     # answers 204 when online
+TRACE_MAX_HOPS = 20
+
+
+def _bind(sock, iface):
+    if is_root() and link_info(iface)["up"]:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+        except OSError:
+            pass
+
+
+def _ipv4s(items):
+    out = []
+    for a in items:
+        a = a.strip()
+        try:
+            if ipaddress.IPv4Address(a) and a not in out and not a.startswith("127."):
+                out.append(a)
+        except ValueError:
+            pass
+    return out
+
+
+def iface_dns(iface):
+    """IPv4 DNS servers handed to `iface` (DHCP), not whatever a VPN put in
+    /etc/resolv.conf. Tries NetworkManager, then systemd-resolved; [] if
+    neither knows the interface."""
+    for cmd in (["nmcli", "-g", "IP4.DNS", "device", "show", iface],
+                ["resolvectl", "dns", iface]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if cmd[0] == "resolvectl":
+            out = out.split(":", 1)[1] if ":" in out else ""
+        found = _ipv4s(out.replace("|", " ").split())
+        if found:
+            return found
+    return []
+
+
+def _dns_name(name):
+    out = b""
+    for label in name.rstrip(".").split("."):
+        b = label.encode("idna")
+        if not 0 < len(b) < 64:
+            raise ValueError(f"bad name: {name}")
+        out += bytes([len(b)]) + b
+    return out + b"\0"
+
+
+def _skip_name(msg, i):
+    while i < len(msg):
+        n = msg[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += n + 1
+    raise ValueError("truncated name")
+
+
+DNS_RCODES = {1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
+
+
+def dns_build_query(qid, name):
+    return struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + _dns_name(name) + struct.pack(">HH", 1, 1)
+
+
+def dns_parse_reply(msg, qid):
+    """(ips, error) from a DNS reply to query `qid`; error is None, an rcode
+    name, or 'no A record'."""
+    if len(msg) < 12:
+        raise ValueError("short reply")
+    rid, flags, qd, an = struct.unpack(">HHHH", msg[:8])
+    if rid != qid:
+        raise ValueError("wrong id")
+    if flags & 0xF:
+        return [], DNS_RCODES.get(flags & 0xF, f"rcode {flags & 0xF}")
+    i = 12
+    for _ in range(qd):
+        i = _skip_name(msg, i) + 4
+    ips = []
+    for _ in range(an):
+        i = _skip_name(msg, i)
+        rtype, _, _, rdlen = struct.unpack(">HHIH", msg[i:i + 10])
+        i += 10
+        if rtype == 1 and rdlen == 4:
+            ips.append(socket.inet_ntoa(msg[i:i + 4]))
+        i += rdlen
+    return ips, None if ips else "no A record"
+
+
+def dns_query(server, name, iface, timeout=2.0):
+    """Ask one server for `name` A records: {'server','ms','ips','err'}."""
+    r = {"server": server, "ms": None, "ips": [], "err": None}
+    qid = int.from_bytes(os.urandom(2), "big")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        _bind(s, iface)
+        t0 = time.monotonic()
+        s.sendto(dns_build_query(qid, name), (server, 53))
+        end = t0 + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([s], [], [], left)[0]:
+                r["err"] = "timeout"
+                break
+            msg, src = s.recvfrom(1500)
+            try:
+                r["ips"], r["err"] = dns_parse_reply(msg, qid)
+            except (ValueError, struct.error):
+                continue                   # not ours / garbled: keep waiting
+            r["ms"] = (time.monotonic() - t0) * 1000
+            break
+    except (OSError, ValueError) as e:
+        r["err"] = getattr(e, "strerror", None) or str(e)
+    finally:
+        s.close()
+    return r
+
+
+def http_check(ip, iface, timeout=4.0):
+    """GET /generate_204 from `ip` (Host: NET_CHECK_HOST).
+    {'state': 'online'|'portal'|'blocked', 'detail', 'ms'}"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        _bind(s, iface)
+        t0 = time.monotonic()
+        s.connect((ip, 80))
+        s.sendall(f"GET /generate_204 HTTP/1.1\r\nHost: {NET_CHECK_HOST}\r\n"
+                  "User-Agent: LAN-Devil\r\nConnection: close\r\n\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head and len(head) < 8192:
+            chunk = s.recv(2048)
+            if not chunk:
+                break
+            head += chunk
+        ms = (time.monotonic() - t0) * 1000
+    except OSError as e:
+        return {"state": "blocked", "detail": e.strerror or str(e), "ms": None}
+    finally:
+        s.close()
+    lines = head.decode("latin-1", "replace").split("\r\n")
+    parts = lines[0].split()
+    code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if code == 204:
+        return {"state": "online", "detail": "HTTP 204", "ms": ms}
+    where = next((ln.split(":", 1)[1].strip() for ln in lines[1:]
+                  if ln.lower().startswith("location:")), None)
+    if where:
+        where = where.split("//", 1)[-1].split("/", 1)[0]
+    return {"state": "portal", "detail": f"HTTP {code or '?'}" + (f" → {where}" if where else ""),
+            "ms": ms}
+
+
+def parse_recverr(cdata):
+    """(icmp_type, icmp_code, offender_ip) from an IP_RECVERR control
+    message (struct sock_extended_err + sockaddr_in), or None if it isn't
+    an ICMP error."""
+    if len(cdata) < 24:
+        return None
+    _, origin, etype, code = struct.unpack("=IBBB", cdata[:7])
+    if origin != 2:                        # SO_EE_ORIGIN_ICMP
+        return None
+    return etype, code, socket.inet_ntoa(cdata[20:24])
+
+
+def trace_hop(ip, ttl, iface, timeout=1.5):
+    """One UDP probe at `ttl`. {'ttl','ip','ms','end'} where end is None,
+    'reached', or an unreachable marker. Uses IP_RECVERR, so no root needed."""
+    hop = {"ttl": ttl, "ip": None, "ms": None, "end": None}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setblocking(False)
+        s.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+        _bind(s, iface)
+        t0 = time.monotonic()
+        s.sendto(b"LAN Devil trace", (ip, 33434 + ttl))
+        end = t0 + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([s], [], [], left)[0]:
+                return hop
+            try:
+                _, anc, _, _ = s.recvmsg(512, 512, socket.MSG_ERRQUEUE)
+            except BlockingIOError:
+                try:
+                    s.recv(512)            # a real UDP answer: the target itself
+                    hop.update(ip=ip, ms=(time.monotonic() - t0) * 1000, end="reached")
+                    return hop
+                except OSError:
+                    continue
+            for level, kind, cdata in anc:
+                if level != socket.IPPROTO_IP or kind != IP_RECVERR:
+                    continue
+                err = parse_recverr(cdata)
+                if not err:
+                    continue
+                etype, code, src = err
+                hop.update(ip=src, ms=(time.monotonic() - t0) * 1000)
+                if etype == 3:             # destination unreachable
+                    hop["end"] = "reached" if code == 3 else {0: "!N", 1: "!H", 13: "!X"}.get(code, f"!{code}")
+                return hop
+    except OSError as e:
+        hop["end"] = f"error: {e.strerror or e}"
+        return hop
+    finally:
+        s.close()
+
+
+def netcheck(job, host, iface, dns):
+    """DNS, then internet/captive-portal, then traceroute -- one job.
+
+    job.data: {'target', 'ip', 'phase', 'dns': [dns_query results],
+               'web': http_check result, 'hops': [trace_hop results]}
+    """
+    d = job.data
+    d.update(target=host, ip=None, phase="dns", dns=[], web=None, hops=[], servers=dns[:3])
+    try:
+        ipaddress.IPv4Address(host)
+        d["ip"] = host
+    except ValueError:
+        for server in dns[:3]:
+            if job.stop.is_set():
+                return
+            r = dns_query(server, host, iface)
+            d["dns"].append(r)
+            if r["ips"] and not d["ip"]:
+                d["ip"] = r["ips"][0]
+        if not dns:
+            d["ip"] = resolve(host)        # no per-port DNS known: system resolver
+            d["dns"].append({"server": "system", "ms": None, "ips": [d["ip"]] if d["ip"] else [],
+                             "err": None if d["ip"] else "can't resolve"})
+
+    d["phase"] = "web"
+    if job.stop.is_set():
+        return
+    check_ip = None
+    for server in dns[:3]:
+        r = dns_query(server, NET_CHECK_HOST, iface)
+        if r["ips"]:
+            check_ip = r["ips"][0]
+            break
+    if not check_ip:
+        check_ip = resolve(NET_CHECK_HOST)
+    d["web"] = http_check(check_ip, iface) if check_ip else \
+        {"state": "blocked", "detail": "DNS failed", "ms": None}
+
+    d["phase"] = "trace"
+    if not d["ip"]:
+        job.emit(f"can't resolve {host}")
+        d["phase"] = "done"
+        return
+    silent = 0
+    for ttl in range(1, TRACE_MAX_HOPS + 1):
+        if job.stop.is_set():
+            break
+        hop = trace_hop(d["ip"], ttl, iface)
+        d["hops"].append(hop)
+        silent = silent + 1 if hop["ip"] is None else 0
+        if hop["end"] or silent >= 5:
+            break
+    d["phase"] = "done"

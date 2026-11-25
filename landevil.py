@@ -6,10 +6,12 @@ Plug the Cardputer's Ethernet port into a switch: the home screen shows
 link speed, flaps, your DHCP lease, and what you're plugged into (switch,
 port, VLAN, voice VLAN, PoE, mgmt IP) from LLDP/CDP. Tabs for a DHCP
 rogue-server probe, trunk VLAN discovery + join, ping with a live RTT
-graph, ARP sweep, a TCP port grid, and a CSV log of every port you visit.
+graph, DNS / internet / traceroute checks, ARP sweep, a TCP port grid, and
+a CSV log of every port you visit. 802.1X ports are flagged on STAT.
 
 Keys:  Left/Right or Tab  switch screen    Up/Down  scroll / select
        Enter              run              Esc      cancel / back
+       Ctrl+S or Print    save a screenshot to ~/landevil/screenshots/
        hold Esc           exit to launcher
 
   landevil.py                 run on the device (APPLaunch starts it via sudo)
@@ -32,6 +34,7 @@ sys.path.insert(0, HERE)
 
 import dhcp  # noqa: E402
 import netdiag  # noqa: E402
+import portlog  # noqa: E402
 import vlan  # noqa: E402
 from device import KEY, keychar  # noqa: E402
 from portlog import PortLog  # noqa: E402
@@ -40,16 +43,18 @@ from ui import (AMBER, BG, BLUE, DIM, DKAMBER, DKGREEN, DKRED, FAINT, GREEN, H, 
                 fit, font, keycap, ms, nice, paste_asset, rj45, scrollbar, set_scale, tag,
                 vendor_color, warn_icon)
 
-VERSION = "0.2.0"
-SCREENS = ["STAT", "DHCP", "VLAN", "PING", "ARP", "PORT", "LOG"]
+VERSION = "0.3.0"
+SCREENS = ["STAT", "DHCP", "VLAN", "PING", "NET", "ARP", "PORT", "LOG"]
 LONG_PRESS = 0.8
 KEY_S, KEY_X = 31, 45
+KEY_RIGHTCTRL, KEY_SYSRQ = 97, 99           # SysRq = the Print key
 
 
 HOST_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
 FIELD_RULES = {                       # screen -> (allowed(c), max length)
     "PING": (lambda c: c in HOST_CHARS, 63),
     "PORT": (lambda c: c in HOST_CHARS, 63),
+    "NET": (lambda c: c in HOST_CHARS, 63),
     "VLAN": (lambda c: c.isdigit(), 4),
     "LOG": (lambda c: c.isprintable(), 40),
 }
@@ -101,6 +106,7 @@ class App:
         self.scroll = {s: 0 for s in SCREENS}
         self.fields = {k: "" for k in FIELD_RULES}
         self.shift = False
+        self.ctrl = False
         self.esc_down = None
         self.hint_until = 0
         self.flash = None                  # (text, colour, until)
@@ -108,6 +114,8 @@ class App:
         self.started = time.monotonic()
         self.facts = {}
         self.facts_at = 0
+        self.fields["NET"] = "example.com"
+        self._dns = (None, 0, [])          # (ip, when, servers): per-port DNS cache
         self.listener = None
         self.cc_base = None
         self.link_changed_at = None
@@ -152,7 +160,7 @@ class App:
             ip, prefix = netdiag.iface_ipv4(self.iface)
             self.facts = {"ip": ip, "prefix": prefix,
                           "gw": netdiag.default_gateway(self.iface, only=True),
-                          "dns": netdiag.dns_servers()}
+                          "dns": self.port_dns(ip, now)}
             self.facts_at = now
             gw = self.facts["gw"] or netdiag.default_gateway(self.iface)
             for k in ("PING", "PORT"):       # prefill targets with the gateway
@@ -161,10 +169,35 @@ class App:
         self.facts["link"] = link
         self.auto_log(now)
 
+    def port_dns(self, ip, now):
+        """DNS servers this port got from DHCP (cached; it shells out). Falls
+        back to resolv.conf, which a VPN such as Tailscale may have taken over."""
+        cip, when, servers = self._dns
+        if ip != cip or now - when > 20:
+            servers = (netdiag.iface_dns(self.iface) if ip else []) or netdiag.dns_servers()
+            self._dns = (ip, now, servers)
+        return servers
+
+    def net_dns(self):
+        """Resolvers the NET check should use for the port probes run on."""
+        if self.joined:
+            return list(self.joined["ack"].get("dns") or []) or self.facts.get("dns") or []
+        servers = list(self.facts.get("dns") or [])
+        job = self.jobs.get("DHCP")             # what the DHCP probe was offered, as backup
+        for o in (job.data.get("offers") or []) if job else []:
+            servers += [a for a in o.get("dns") or [] if a not in servers]
+        return [a for a in servers if ":" not in a]
+
     def neighbor(self):
         if self.demo:
             return self.demo.get("neighbor")
         return self.listener.latest()
+
+    def auth(self):
+        """802.1X state heard on the port (see NeighborListener.auth_state)."""
+        if self.demo:
+            return self.demo.get("auth")
+        return self.listener.auth_state() if self.listener else None
 
     def snapshot_row(self):
         """What the port log records about where we're plugged in now."""
@@ -208,6 +241,15 @@ class App:
         if not link.get("up"):
             return []
         out = []
+        a = self.auth()
+        if a and a["age"] < 180:
+            if a.get("result") == "Failure":
+                out.append((RED, "802.1X: authentication failed on this port"))
+            elif a.get("result") != "Success":
+                if not self.facts.get("ip"):
+                    out.append((RED, "802.1X port: needs login, no DHCP until then"))
+                else:
+                    out.append((AMBER, "802.1X port: in via MAB or a guest VLAN?"))
         n = self.neighbor() or {}
         ours = (link.get("speed"), link.get("duplex"))
         theirs = n.get("mau")
@@ -229,6 +271,15 @@ class App:
     def on_key(self, code, value):
         if code in (KEY["LEFTSHIFT"], KEY["RIGHTSHIFT"]):
             self.shift = value != 0
+            return
+        if code in (KEY["LEFTCTRL"], KEY_RIGHTCTRL):
+            self.ctrl = value != 0
+            return
+        if code == KEY_SYSRQ or (self.ctrl and code == KEY_S):
+            if value == 1:
+                self.screenshot()
+            return
+        if self.ctrl:                      # no other Ctrl shortcuts; don't type them
             return
         if code == KEY["ESC"]:
             if value == 1:
@@ -293,6 +344,8 @@ class App:
             self.jobs[name] = Job(netdiag.arp_sweep, ti)
         elif name == "PORT" and self.fields["PORT"]:
             self.jobs[name] = Job(netdiag.port_scan, self.fields["PORT"], ti)
+        elif name == "NET" and self.fields["NET"]:
+            self.jobs[name] = Job(netdiag.netcheck, self.fields["NET"], ti, self.net_dns())
         elif name == "DHCP":
             self.jobs[name] = Job(dhcp.probe, ti)
         elif name == "VLAN":
@@ -306,6 +359,27 @@ class App:
             if self.log.append(row):
                 self.fields["LOG"] = ""
                 self.say("logged" + (f" {row['switch']} {row['port']}" if row["switch"] else ""))
+
+    def screenshot(self):
+        """Save the current screen (without any message overlay) as a PNG
+        in the desktop user's ~/landevil/screenshots/."""
+        img = self.render()
+        home, uid, gid = portlog._owner()
+        folder = os.path.join(home, "landevil", "screenshots")
+        name = f"landevil-{time.strftime('%Y%m%d-%H%M%S')}-{SCREENS[self.screen].lower()}.png"
+        try:
+            for d in (os.path.dirname(folder), folder):
+                if not os.path.isdir(d):
+                    os.makedirs(d, exist_ok=True)
+                    if uid is not None:
+                        os.chown(d, uid, gid)
+            path = os.path.join(folder, name)
+            img.save(path)
+            if uid is not None:
+                os.chown(path, uid, gid)
+            self.say(f"saved ~/landevil/screenshots/{name}")
+        except OSError as e:
+            self.say(f"screenshot failed: {e.strerror or e}", RED)
 
     def vlan_rows(self):
         """Merge what we've *seen* tagged with what the switch *advertises*."""
@@ -398,9 +472,6 @@ class App:
     def draw_header(self, img, d):
         d.rectangle([0, 0, W, 18], fill=PANEL)
         paste_asset(img, "logo120.png", (15, 15), (3, 2))
-        tf = font("bold", 10)
-        d.text((22, 3), "LAN", font=tf, fill=TEXT)
-        d.text((22 + d.textlength("LAN ", font=tf), 3), "DEVIL", font=tf, fill=RED)
         f = font("bold", 9)
         x = W - 3
         for i in reversed(range(len(SCREENS))):
@@ -420,6 +491,10 @@ class App:
             if busy:
                 d.ellipse([x + w - 5, 2, x + w - 1, 6], fill=GREEN if i != self.screen else BG)
             x -= 1
+        tf = font("bold", 10)
+        if 22 + d.textlength("LAN DEVIL", font=tf) + 4 <= x:   # wordmark only if the tabs leave room
+            d.text((22, 3), "LAN", font=tf, fill=TEXT)
+            d.text((22 + d.textlength("LAN ", font=tf), 3), "DEVIL", font=tf, fill=RED)
         d.line([0, 18, W, 18], fill=LINE)
 
     def draw_footer(self, d):
@@ -455,7 +530,7 @@ class App:
                 x = keycap(d, x, y, "Enter", "log port")
             elif name != "STAT":
                 x = keycap(d, x, y, "Enter", "probe" if name == "DHCP" else "run")
-        if name in ("ARP", "DHCP", "LOG"):
+        if name in ("ARP", "DHCP", "LOG", "NET"):
             keycap(d, x, y, "ud", "scroll")
         elif name == "STAT":
             keycap(d, x, y, "Esc", "hold to exit")
@@ -526,11 +601,19 @@ class App:
 
     def draw_neighbor(self, d, n, top, alerts):
         x = tag(d, 14, top + 5, n["proto"], AMBER)
+        a = self.auth()
+        tags = []
+        if a and a["age"] < 180:
+            tags.append(("802.1X", GREEN if a.get("result") == "Success" else RED))
         poe = netdiag.poe_text(n.get("poe"))
         if poe:
-            x = tag(d, x, top + 5, poe, BLUE)
+            tags.append((poe, BLUE))
         if n.get("voice_vlan"):
-            tag(d, x, top + 5, f"VOICE {n['voice_vlan']}", (232, 96, 200))
+            tags.append((f"VOICE {n['voice_vlan']}", (232, 96, 200)))
+        for text, col in tags:
+            if x + d.textlength(text, font=font("bold", 8)) + 8 > W - 58:
+                break
+            x = tag(d, x, top + 5, text, col)
         age = n.get("age")
         when = "cached" if age is None else ("just now" if age < 2 else f"{int(age)}s ago")
         d.text((W - 12, top + 5), when, font=font("sans", 9), fill=DIM, anchor="ra")
@@ -834,6 +917,85 @@ class App:
 
     # ---- ARP ------------------------------------------------------------
 
+    # ---- NET ------------------------------------------------------------
+
+    def draw_net(self, d):
+        job = self.jobs.get("NET")
+        self.draw_field(d, "NET", "HOST")
+        if not job:
+            empty(d, "Can this port reach the internet?",
+                  ["Looks the host up on this port's DNS, checks",
+                   "for internet or a captive portal, then traces",
+                   "the route hop by hop."],
+                  warn="Sends DNS queries, one HTTP request, UDP probes", top=46)
+            return
+        data, phase = job.data, job.data.get("phase")
+        dns, web, hops = data.get("dns") or [], data.get("web"), data.get("hops") or []
+
+        # three summary cards
+        cards = []
+        ok = [r for r in dns if r["ips"]]
+        if not dns and data.get("ip") and phase != "dns":
+            cards.append(("DNS", "IP given", DIM))
+        elif phase == "dns" and job.running:
+            cards.append(("DNS", "asking…", DIM))
+        elif ok:
+            cards.append(("DNS", "OK" + (f" {ok[0]['ms']:.0f}ms" if ok[0]["ms"] else ""),
+                          GREEN if len(ok) == len(dns) else AMBER))
+        else:
+            cards.append(("DNS", (dns[0]["err"] if dns else "none") or "fail", RED))
+        if web:
+            st = web["state"]
+            cards.append(("INTERNET", {"online": "ONLINE", "portal": "PORTAL"}.get(st, "NO"),
+                          {"online": GREEN, "portal": AMBER}.get(st, RED)))
+        else:
+            cards.append(("INTERNET", "checking…" if job.running and phase in ("dns", "web") else "—", DIM))
+        end = hops[-1]["end"] if hops else None
+        if end == "reached":
+            cards.append(("TRACE", f"{len(hops)} hops", GREEN))
+        elif hops and job.running:
+            cards.append(("TRACE", f"hop {len(hops)}…", DIM))
+        elif end:
+            cards.append(("TRACE", end, RED))
+        elif hops:
+            cards.append(("TRACE", f"{len(hops)}, no end", AMBER))
+        else:
+            cards.append(("TRACE", "—" if not job.running else "waiting", DIM))
+        cw, cx, cy = (W - 12) // 3, 6, 43
+        for label, val, col in cards:
+            d.rounded_rectangle([cx, cy, cx + cw - 4, cy + 24], radius=4, fill=PANEL)
+            d.text((cx + 5, cy + 2), label, font=font("bold", 7), fill=DIM)
+            d.text((cx + 5, cy + 10), fit(d, val, font("bold", 11), cw - 13), font=font("bold", 11), fill=col)
+            cx += cw
+
+        # detail list: DNS servers, internet detail, then hops
+        rows = []
+        for r in dns:
+            res = ", ".join(r["ips"][:2]) if r["ips"] else r["err"] or "?"
+            rows.append(("DNS", r["server"], res, r["ms"], GREEN if r["ips"] else RED))
+        if web:
+            rows.append(("WEB", web["detail"], "", web["ms"],
+                         {"online": GREEN, "portal": AMBER}.get(web["state"], RED)))
+        for h in hops:
+            col = GREEN if h["end"] == "reached" else (RED if h["end"] else TEXT)
+            rows.append((str(h["ttl"]), h["ip"] or "*", h["end"] if h["end"] not in (None, "reached") else "",
+                         h["ms"], col if h["ip"] else FAINT))
+        top, lh = 71, 12
+        nrows = (H - 18 - top) // lh
+        self.scroll["NET"] = min(self.scroll["NET"], max(0, len(rows) - nrows))
+        start = self.scroll["NET"]
+        for i, (k, a, b, ms_, col) in enumerate(rows[start:start + nrows]):
+            y = top + i * lh
+            kcol = PANEL2 if k.isdigit() else (DKAMBER if k == "WEB" else PANEL2)
+            d.rounded_rectangle([6, y + 1, 30, y + 10], radius=2, fill=kcol)
+            d.text((18, y + 1), k, font=font("bold", 7), fill=DIM, anchor="ma")
+            d.text((36, y), fit(d, a, font("monob", 10), 128), font=font("monob", 10), fill=col)
+            if b:
+                d.text((168, y + 1), fit(d, b, font("mono", 9), 100), font=font("mono", 9), fill=DIM)
+            if ms_ is not None:
+                d.text((W - 8, y + 1), ms(ms_), font=font("sans", 9), fill=DIM, anchor="ra")
+        scrollbar(d, top, nrows, len(rows), start, lh)
+
     def draw_arp(self, d):
         job = self.jobs.get("ARP")
         if not job:
@@ -1018,10 +1180,16 @@ def preview(out_dir):
     now = time.monotonic()
     shots = [("splash", splash())]
 
-    app.screen = 0
+    app.screen = SCREENS.index("STAT")
     shots.append(("status", app.render()))
+    app.demo = dict(app.demo, auth={"count": 3, "age": 12, "last": "Request", "method": None,
+                                    "prompt": None, "src": "00:25:84:aa:10:3f", "result": None})
+    app.facts = dict(app.facts, ip=None, prefix=None, gw=None)
+    shots.append(("dot1x", app.render()))
+    app.demo = dict(app.demo, auth=None)
+    app.refresh()
 
-    app.screen = 1
+    app.screen = SCREENS.index("DHCP")
     o1 = {"server": "10.20.0.1", "src_mac": "00:1a:2b:3c:4d:01", "yiaddr": "10.20.0.58", "prefix": 24,
           "router": ["10.20.0.1"], "dns": ["10.20.0.1", "1.1.1.1"], "lease": 86400,
           "domain": "example.lan", "tftp": None, "bootfile": None, "giaddr": "0.0.0.0"}
@@ -1031,7 +1199,7 @@ def preview(out_dir):
     app.jobs["DHCP"] = _Done({"iface": "eth0", "offers": [o1, o2], "started": now - 5})
     shots.append(("dhcp", app.render()))
 
-    app.screen = 2
+    app.screen = SCREENS.index("VLAN")
     def v(frames, macs, ips, last, kinds):
         return {"frames": frames, "macs": set(range(macs)), "ips": set(ips),
                 "kinds": kinds, "first": now - 40, "last": now - last}
@@ -1047,7 +1215,7 @@ def preview(out_dir):
     shots.append(("vlan", app.render()))
     app.vjoin = None
 
-    app.screen = 3
+    app.screen = SCREENS.index("PING")
     rtts = [round(random.uniform(0.45, 0.75), 3) for _ in range(38)]
     rtts[17], rtts[29] = 2.9, None
     rtts[30] = 1.4
@@ -1055,7 +1223,20 @@ def preview(out_dir):
                               "rtts": rtts, "sent": len(rtts)}, running=True)
     shots.append(("ping", app.render()))
 
-    app.screen = 4
+    app.screen = SCREENS.index("NET")
+    trace = ["10.20.0.1", "10.0.0.1", "96.120.88.13", "68.85.220.185", "24.124.155.129",
+             "96.110.33.114", None, "172.68.32.28", "1.1.1.1"]
+    app.jobs["NET"] = _Done({
+        "target": "one.one.one.one", "ip": "1.1.1.1", "phase": "done",
+        "dns": [{"server": "10.20.0.1", "ms": 3.1, "ips": ["1.1.1.1", "1.0.0.1"], "err": None},
+                {"server": "1.1.1.1", "ms": 14.2, "ips": ["1.1.1.1", "1.0.0.1"], "err": None}],
+        "web": {"state": "online", "detail": "HTTP 204", "ms": 66.0},
+        "hops": [{"ttl": i + 1, "ip": ip, "ms": None if ip is None else 0.6 + i * 1.7,
+                  "end": "reached" if ip == "1.1.1.1" else None} for i, ip in enumerate(trace)]})
+    app.fields["NET"] = "one.one.one.one"
+    shots.append(("net", app.render()))
+
+    app.screen = SCREENS.index("ARP")
     hosts = [("10.20.0.1", "00:1a:2b:3c:4d:01", "Ubiquiti Inc"),
              ("10.20.0.2", "00:25:84:aa:10:3f", "Cisco Systems, Inc"),
              ("10.20.0.11", "3c:52:82:19:7e:c0", "Hewlett Packard"),
@@ -1068,13 +1249,13 @@ def preview(out_dir):
     app.jobs["ARP"] = _Done({"net": "10.20.0.0/24", "total": 253, "sent": 253, "hosts": hosts})
     shots.append(("arp", app.render()))
 
-    app.screen = 5
+    app.screen = SCREENS.index("PORT")
     opened = {22, 80, 139, 443, 445, 5000}
     state = {p: ("open" if p in opened else "closed") for p, _ in netdiag.COMMON_PORTS}
     app.jobs["PORT"] = _Done({"target": "10.20.0.40", "ip": "10.20.0.40", "state": state})
     shots.append(("ports", app.render()))
 
-    app.screen = 6
+    app.screen = SCREENS.index("LOG")
     base = {"vlan": 20, "proto": "LLDP", "link": "100M FD"}
     for t, lab, sw, port, vl in [("09:12", "auto", "sw-closet-3", "Gi1/0/12", 20),
                                  ("09:14", "Rm 210 jack A", "sw-closet-3", "Gi1/0/14", 20),

@@ -5,8 +5,10 @@
 The LAN Devil pocket network-ID tool as a CardputerZero APPLaunch app.
 Plug the Cardputer's Ethernet port into a switch port and the home screen
 shows link speed, your DHCP lease, and what you're plugged into -- switch
-name, port, VLAN, management IP -- from LLDP/CDP. Ping (live latency
-graph), ARP sweep (with MAC vendors) and a TCP port grid are one key away.
+name, port, VLAN, management IP -- from LLDP/CDP -- and flags ports that
+want an 802.1X login. Ping (live latency graph), a DNS / internet /
+traceroute check, ARP sweep (with MAC vendors) and a TCP port grid are one
+key away.
 
 LAN Devil started as a Raspberry Pi build (Python + lldpd + e-paper) and
 ESP32 firmware; the LLDP/CDP TLV parsing here is ported from the firmware
@@ -15,20 +17,32 @@ CardputerZero the keyboard and screen are the whole interface.
 
 ![status](store/screenshots/status.png) ![dhcp](store/screenshots/dhcp.png)
 ![vlan](store/screenshots/vlan.png) ![log](store/screenshots/log.png)
-![ping](store/screenshots/ping.png) ![arp](store/screenshots/arp.png)
-![ports](store/screenshots/ports.png)
+![ping](store/screenshots/ping.png) ![net](store/screenshots/net.png)
+![arp](store/screenshots/arp.png) ![ports](store/screenshots/ports.png)
+![802.1X](store/screenshots/dot1x.png)
 
 ## Screens
 
 | Tab | What it does |
 |---|---|
-| **STAT** | Link + speed ladder + duplex, flap counter (kernel `carrier_changes`), IP/GW/DNS. Neighbor card: switch, port, native VLAN, mgmt IP, **PoE** (802.3af/at class + watts, LLDP-MED, CDP), **voice VLAN** (LLDP-MED / CDP), and the switch's own speed/duplex. Alerts on **speed/duplex mismatch**, half duplex, 10M links and recent flaps. |
+| **STAT** | Link + speed ladder + duplex, flap counter (kernel `carrier_changes`), IP/GW/DNS. Neighbor card: switch, port, native VLAN, mgmt IP, **PoE** (802.3af/at class + watts, LLDP-MED, CDP), **voice VLAN** (LLDP-MED / CDP), and the switch's own speed/duplex. Alerts on **speed/duplex mismatch**, half duplex, 10M links and recent flaps. **802.1X**: the switch's EAP-Request/Identity frames are heard passively, so a port that wants a login gets an `802.1X` tag and a "needs login, no DHCP until then" alert (or "authentication failed", or "in via MAB / guest VLAN?" when you got an address anyway). |
 | **DHCP** | Broadcasts one DHCPDISCOVER (no lease taken) and lists **every** server that offers: offered IP, gateway, DNS, lease, domain, TFTP/boot, relay. Two or more servers -> red **possible rogue** banner. |
 | **VLAN** | `S` watches 802.1Q-tagged frames on a trunk (passive): per VLAN frames, hosts, guessed subnet, merged with what the switch advertises (native / voice / named VLANs). `Enter` **joins** the selected (or typed) VLAN: creates `eth0.N`, gets a DHCP lease, and DHCP/Ping/ARP/Port then run on that VLAN (header shows `V30`). `X` leaves (DHCPRELEASE + link removed); exiting the app always cleans up. No default route is added, so Wi-Fi/SSH are unaffected. |
 | **PING** | Live RTT bar graph (lost = red X) + recv/loss/avg/min-max tiles. |
+| **NET** | One key, three answers for the host you type: **DNS** (asks the DNS servers *this port* got from DHCP, not a VPN's resolver), **internet** (`generate_204`: online, **captive portal** with its redirect host, or blocked) and a **traceroute** (UDP probes, no root or `traceroute` package needed). All pinned to the wired port. |
 | **ARP** | Subnet sweep (capped /24) with MAC vendors. |
 | **PORT** | TCP connect grid of 28 common services. |
 | **LOG** | Every new switch+port is **auto-logged**; type a note ("Rm 214 jack B") + Enter to add a labelled row. CSV at `~/landevil/ports.csv` (owned by the desktop user even though the app runs under sudo). |
+
+## Keys
+
+| Key | Does |
+|---|---|
+| Left / Right, Tab | switch tab |
+| Up / Down | scroll / select |
+| Enter | run the tab's probe |
+| Esc | stop / clear / back to STAT; **hold** to exit |
+| Ctrl+S (or Print on the uConsole) | save the screen as a PNG in `~/landevil/screenshots/` |
 
 ## Neighbor discovery: raw capture *and* lldpd
 
@@ -104,7 +118,7 @@ normal window on any desktop for development.
 
 ```bash
 python3 landevil.py --preview /tmp/ld      # renders the splash + all 7 screens with demo data
-cd tests && python3 -m unittest test_netdiag test_v02
+cd tests && python3 -m unittest test_netdiag test_v02 test_v03
 python3 packaging/build_deb.py                                # -> build/landevil_<ver>_all.deb
 ```
 

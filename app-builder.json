@@ -1,12 +1,12 @@
 {
   "package_name": "landevil",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "app_name": "LAN Devil",
   "bin_name": "landevil",
-  "description": "Pocket network ID: switch, port, VLAN, PoE via LLDP/CDP; rogue DHCP, VLAN hunting, ping, ARP, port scan, port log",
+  "description": "Pocket network ID: switch, port, VLAN, PoE via LLDP/CDP; 802.1X detection, rogue DHCP, VLAN hunting, ping, DNS/internet/traceroute, ARP, port scan, port log",
   "store": {
     "summary": "Plug into a switch port: see switch, port, VLAN and mgmt IP",
-    "description": "LAN Devil turns the CardputerZero's Ethernet port into a pocket network ID tool. Plug into any switch port and the home screen shows link speed and flaps, your DHCP lease and the switch's name, port, VLAN, voice VLAN, PoE class/wattage and management IP from LLDP/CDP, with an alert on speed/duplex mismatch. Tabs: DHCP probe that flags rogue servers; trunk VLAN discovery with one-key join (DHCP on the VLAN, then every tool runs there); ping with a live latency graph; ARP sweep with MAC vendors; a TCP port grid; and a CSV log of every port you plug into, with notes. DHCP probe, ARP sweep and port scan send traffic; use them only on networks you are authorized to test.",
+    "description": "LAN Devil turns the CardputerZero's Ethernet port into a pocket network ID tool. Plug into any switch port and the home screen shows link speed and flaps, your DHCP lease and the switch's name, port, VLAN, voice VLAN, PoE class/wattage and management IP from LLDP/CDP, with alerts for speed/duplex mismatch and 802.1X ports that want a login. Tabs: DHCP probe that flags rogue servers; trunk VLAN discovery with one-key join (DHCP on the VLAN, then every tool runs there); ping with a live latency graph; a NET check (DNS on this port's servers, internet or captive portal, traceroute); ARP sweep with MAC vendors; a TCP port grid; and a CSV log of every port you plug into, with notes. Ctrl+S saves a screenshot. DHCP probe, NET check, ARP sweep and port scan send traffic; use them only on networks you are authorized to test.",
     "categories": [
       "System Tools",
       "Security"
@@ -15,6 +15,7 @@
       "store/screenshots/status.png",
       "store/screenshots/dhcp.png",
       "store/screenshots/vlan.png",
+      "store/screenshots/net.png",
       "store/screenshots/ping.png"
     ],
     "icon": "packaging/icon.png",
