@@ -1,6 +1,6 @@
 {
   "package_name": "landevil",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "app_name": "LAN Devil",
   "bin_name": "landevil",
   "description": "Pocket network ID: switch, port, VLAN, PoE via LLDP/CDP; 802.1X detection, rogue DHCP, VLAN hunting, ping, DNS/internet/traceroute, ARP, port scan, port log",

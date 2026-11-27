@@ -63,6 +63,14 @@ launcher wrapper re-execs under passwordless `sudo` when the image allows
 it (stock images do). Without it: neighbors come from lldpd, the ARP sweep
 uses the kernel ARP table, and DHCP/VLAN say they need root.
 
+On first launch a **Permissions** pop-up says which of these this launch
+got, and whether lldpd is installed. When the app can run apt as root it
+offers **Enter: install lldpd** / **Esc: skip**; otherwise it shows the
+`sudo apt install lldpd` command to run over SSH. It shows once (marker:
+`~/landevil/.welcome-seen`); `landevil.py --welcome` brings it back. Later, if STAT
+has heard no neighbor for 30 s (or capture is off) and lldpd is missing,
+it shows **I install lldpd**, which reopens the pop-up.
+
 ## Files
 
 | File | What |
@@ -72,6 +80,7 @@ uses the kernel ARP table, and DHCP/VLAN say they need root.
 | `dhcp.py` | raw-socket DHCP: rogue probe, one-shot lease (DORA), release |
 | `vlan.py` | tagged-frame watcher (BPF + PACKET_AUXDATA), VLAN join/leave |
 | `portlog.py` | the CSV port log |
+| `firstrun.py` | first-launch permissions pop-up: root / lldpd status, lldpd install via apt |
 | `ui.py` | palette, fonts, drawn icons/widgets |
 | `device.py` | framebuffer (finds the ST7789 panel, never assumes fb0) and raw evdev keyboard -- no python3-evdev needed |
 | `window.py` | desktop window backend for the uConsole (`--window`): Tk, scaled frame, keys mapped to the same keycodes |

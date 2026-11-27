@@ -17,6 +17,7 @@ Keys:  Left/Right or Tab  switch screen    Up/Down  scroll / select
   landevil.py                 run on the device (APPLaunch starts it via sudo)
   landevil.py --window        run fullscreen in a desktop window (uConsole)
   landevil.py --windowed      same, in a normal window (F11 toggles fullscreen)
+  landevil.py --welcome       show the first-launch permissions pop-up again
   landevil.py --preview DIR   render screenshots with demo data (no device)
 """
 
@@ -33,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import dhcp  # noqa: E402
+import firstrun  # noqa: E402
 import netdiag  # noqa: E402
 import portlog  # noqa: E402
 import vlan  # noqa: E402
@@ -43,10 +45,11 @@ from ui import (AMBER, BG, BLUE, DIM, DKAMBER, DKGREEN, DKRED, FAINT, GREEN, H, 
                 fit, font, keycap, ms, nice, paste_asset, rj45, scrollbar, set_scale, tag,
                 vendor_color, warn_icon)
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SCREENS = ["STAT", "DHCP", "VLAN", "PING", "NET", "ARP", "PORT", "LOG"]
 LONG_PRESS = 0.8
-KEY_S, KEY_X = 31, 45
+KEY_S, KEY_X, KEY_I = 31, 45, 23
+LLDPD_HINT_AFTER = 30         # s of silence on STAT before suggesting lldpd
 KEY_RIGHTCTRL, KEY_SYSRQ = 97, 99           # SysRq = the Print key
 
 
@@ -97,8 +100,13 @@ class Job:
 # ---------------------------------------------------------------------------
 
 class App:
-    def __init__(self, demo=None):
+    def __init__(self, demo=None, welcome=False):
         self.demo = demo
+        self.welcome = welcome             # first-launch permissions pop-up showing
+        self.welcome_first = welcome       # opened at launch (vs. from the STAT hint)
+        self.install = None                # lldpd install Job
+        self.install_said = False
+        self.perms = None                  # (root, lldpd, can_install), read when shown
         self.iface = demo["iface"] if demo else netdiag.pick_interface()
         self.screen = 0
         self.jobs = {}
@@ -281,6 +289,9 @@ class App:
             return
         if self.ctrl:                      # no other Ctrl shortcuts; don't type them
             return
+        if self.welcome:
+            self.welcome_key(code, value)
+            return
         if code == KEY["ESC"]:
             if value == 1:
                 self.esc_down = time.monotonic()
@@ -308,6 +319,9 @@ class App:
                 self.vlan_enter()
             elif not running:
                 self.start(name)
+        elif name == "STAT" and code == KEY_I and self.lldpd_hint():
+            self.perms = None              # re-check: root/lldpd may have changed
+            self.welcome, self.welcome_first = True, False
         elif name == "VLAN" and code == KEY_S and not self.fields["VLAN"]:
             self.start("VLAN")
         elif name == "VLAN" and code == KEY_X:
@@ -320,6 +334,69 @@ class App:
                 ok, maxlen = FIELD_RULES[name]
                 if c and ok(c) and len(self.fields[name]) < maxlen:
                     self.fields[name] += c
+
+    # ---- first-launch pop-up --------------------------------------------
+
+    def permissions(self):
+        if self.perms is None:
+            if self.demo:
+                self.perms = self.demo.get("perms", (False, False, True))
+            else:
+                self.perms = (firstrun.is_root(), firstrun.lldpd_installed(), firstrun.can_install())
+        return self.perms
+
+    def lldpd_hint(self):
+        """Suggest lldpd on STAT: the link is up, nothing has been heard for
+        LLDPD_HINT_AFTER s (or raw capture is off) and lldpd isn't installed."""
+        if self.neighbor() or not self.facts.get("link", {}).get("up"):
+            return False
+        if self.demo:
+            if self.demo.get("perms", (False, False, True))[1]:
+                return False
+            err, since = None, self.demo.get("listen_since", self.started)
+        else:
+            if firstrun.lldpd_installed():
+                return False
+            err, since = self.listener.error, self.listener.listen_since
+        return bool(err) or time.monotonic() - since >= LLDPD_HINT_AFTER
+
+    def welcome_key(self, code, value):
+        """Enter installs lldpd (when that's on offer), Esc closes; holding
+        Esc still exits the app. Everything else is ignored while it shows."""
+        if code == KEY["ESC"]:
+            if value == 1:
+                self.esc_down = time.monotonic()
+            elif value == 0 and self.esc_down is not None:
+                held = time.monotonic() - self.esc_down
+                self.esc_down = None
+                if held < LONG_PRESS:
+                    self.close_welcome()
+            return
+        if value != 1 or code not in (KEY["ENTER"], KEY["KPENTER"]):
+            return
+        root, lldpd, can = self.permissions()
+        if self.install is None and not lldpd and can:
+            self.install = Job(firstrun.install_lldpd)
+        elif self.install is None or not self.install.running:
+            self.close_welcome()
+
+    def close_welcome(self):
+        self.welcome = False
+        if not self.demo:
+            firstrun.mark_seen()
+        if self.install and self.install.running:
+            self.say("installing lldpd in the background...", AMBER)
+
+    def install_done(self):
+        """Announce the result of an install that finished after the pop-up
+        was closed."""
+        j = self.install
+        if j and not j.running and not self.install_said and not self.welcome:
+            self.install_said = True
+            if j.data.get("ok"):
+                self.say("lldpd installed: neighbors from lldpd too", GREEN, 4)
+            else:
+                self.say(f"lldpd install failed: {j.last()}", RED, 5)
 
     def back(self):
         name = SCREENS[self.screen]
@@ -449,6 +526,7 @@ class App:
         if self.esc_down is not None and time.monotonic() - self.esc_down >= LONG_PRESS:
             self.quit = True
         self.on_joined()
+        self.install_done()
 
     def shutdown(self):
         for j in self.jobs.values():
@@ -464,6 +542,8 @@ class App:
         self.draw_header(img, d)
         getattr(self, "draw_" + SCREENS[self.screen].lower())(d)
         self.draw_footer(d)
+        if self.welcome:
+            self.draw_welcome(img, d)
         if self.esc_down is not None:            # long-press progress
             frac = min(1.0, (time.monotonic() - self.esc_down) / LONG_PRESS)
             d.rectangle([0, H - 2, int(W * frac), H], fill=RED)
@@ -534,6 +614,69 @@ class App:
             keycap(d, x, y, "ud", "scroll")
         elif name == "STAT":
             keycap(d, x, y, "Esc", "hold to exit")
+
+    # ---- first-launch pop-up --------------------------------------------
+
+    def draw_welcome(self, img, d):
+        root, lldpd, can = self.permissions()
+        job = self.install
+        if job and not job.running and job.data.get("ok"):
+            lldpd = True
+        x0, y0, x1, y1 = 8, 22, W - 8, H - 4
+        d.rounded_rectangle([x0, y0, x1, y1], radius=6, fill=PANEL, outline=AMBER)
+        d.text((x0 + 8, y0 + 5), "Permissions", font=font("bold", 12), fill=TEXT)
+        if self.welcome_first:
+            d.text((x1 - 8, y0 + 7), "first launch", font=font("sans", 9), fill=DIM, anchor="ra")
+        tw = 46
+        tx = x0 + 8
+        bx = tx + tw + 6
+        width = x1 - 8 - bx
+        fs = font("sans", 9)
+
+        def block(y, label, ok, text):
+            tag(d, tx, y + 1, label, GREEN if ok else AMBER)
+            for line in wrap(d, text, fs, width)[:3]:
+                d.text((bx, y), line, font=fs, fill=TEXT)
+                y += 11
+            return y + 4
+
+        y = y0 + 23
+        if root:
+            y = block(y, "ROOT", True, "Running as root: LLDP/CDP capture, "
+                      "DHCP probe, VLAN join and ARP all work.")
+        else:
+            y = block(y, "NO ROOT", False, "sudo wanted a password, so LLDP/CDP capture, "
+                      "the DHCP probe and VLAN join are off. Ping, NET, port scan work.")
+        if lldpd:
+            y = block(y, "lldpd", True, "Installed: keeps the switch's neighbor even when "
+                      "the app misses a frame or has no root.")
+        elif root:
+            y = block(y, "lldpd", False, "Recommended: on busy ports the app can miss the "
+                      "switch's LLDP; lldpd keeps it. Announces this device too.")
+        else:
+            y = block(y, "lldpd", False, "Recommended: shows the switch without root and "
+                      "keeps it on busy ports. Announces this device too.")
+
+        fy = y1 - 15
+        kx = x0 + 8
+        if job and job.running:
+            d.text((kx, fy - 13), fit(d, job.last() or "installing lldpd...", fs, x1 - 8 - kx),
+                   font=fs, fill=AMBER)
+            keycap(d, kx, fy, "Esc", "hide (keeps installing)")
+        elif job:
+            ok = job.data.get("ok")
+            d.text((kx, fy - 13), fit(d, "lldpd installed" if ok else f"failed: {job.last()}",
+                                      fs, x1 - 8 - kx), font=fs, fill=GREEN if ok else RED)
+            keycap(d, kx, fy, "Enter", "close")
+        elif not lldpd and can:
+            kx = keycap(d, kx, fy, "Enter", "install lldpd")
+            keycap(d, kx, fy, "Esc", "skip")
+        elif not lldpd:
+            d.text((kx, fy - 13), "To add it, over SSH:  sudo apt install lldpd",
+                   font=font("mono", 9), fill=DIM)
+            keycap(d, kx, fy, "Esc", "got it")
+        else:
+            keycap(d, kx, fy, "Enter", "got it")
 
     # ---- STATUS ---------------------------------------------------------
 
@@ -653,6 +796,8 @@ class App:
         if err:
             d.text((20, top + 12), "Neighbor capture unavailable", font=font("bold", 12), fill=RED)
             d.text((20, top + 32), fit(d, err, font("mono", 10), W - 40), font=font("mono", 10), fill=DIM)
+            if self.lldpd_hint():
+                self.draw_lldpd_hint(d, W - 20, top + 52)
             return
         t = time.monotonic()
         for k in range(3):
@@ -661,7 +806,8 @@ class App:
             c = tuple(int(a * (1 - ph) + b * ph) for a, b in zip(AMBER, PANEL))
             d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=c, width=2)
         d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=AMBER)
-        since = self.listener.listen_since if self.listener else self.started
+        since = (self.listener.listen_since if self.listener
+                 else (self.demo or {}).get("listen_since", self.started))
         waited = time.monotonic() - since
         d.text((74, top + 12), "Listening for LLDP / CDP", font=font("bold", 13), fill=AMBER)
         if alerts:
@@ -677,6 +823,14 @@ class App:
                                 fill=AMBER if waited < 60 else FAINT)
         msg = f"{int(waited)}s" if waited < 60 else f"{int(waited)}s · unmanaged switch?"
         d.text((74, by + 9), msg, font=font("sans", 9), fill=DIM)
+        if self.lldpd_hint():
+            self.draw_lldpd_hint(d, bx1, by + 9)
+
+    def draw_lldpd_hint(self, d, right, y):
+        """'[I] install lldpd', right-aligned to `right`."""
+        fk, fa = font("bold", 8), font("sans", 9)
+        w = int(d.textlength("I", font=fk)) + 8 + 4 + int(d.textlength("install lldpd", font=fa))
+        keycap(d, right - w, y, "I", "install lldpd")
 
     def kv(self, d, x, y, k, v, width, kw=22):
         d.text((x, y + 2), k, font=font("bold", 7), fill=DIM)
@@ -1122,6 +1276,21 @@ class App:
         scrollbar(d, y, nrows, len(newest), start, lh)
 
 
+def wrap(d, text, fnt, width):
+    """Greedy word wrap to `width` pixels."""
+    lines, cur = [], ""
+    for word in text.split():
+        t = f"{cur} {word}" if cur else word
+        if cur and d.textlength(t, font=fnt) > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = t
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def _k(n):
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
@@ -1183,6 +1352,21 @@ def preview(out_dir):
 
     app.screen = SCREENS.index("STAT")
     shots.append(("status", app.render()))
+    app.demo = dict(app.demo, neighbor=None, listen_since=now - 42)
+    shots.append(("lldpd-hint", app.render()))
+    app.demo = dict(app.demo, listen_since=now)
+    app.demo["neighbor"] = demo_data("")["neighbor"]
+    app.welcome = app.welcome_first = True  # first-launch pop-up, in each state
+    for tag_, perms in [("welcome", (False, False, True)), ("welcome-root", (True, False, True)),
+                        ("welcome-nosudo", (False, False, False))]:
+        app.perms = perms
+        shots.append((tag_, app.render()))
+    app.perms = (False, False, True)
+    app.install = _Done({}, ["Unpacking lldpd (1.0.16-1+deb12u1) ..."], running=True)
+    shots.append(("welcome-installing", app.render()))
+    app.install = _Done({"ok": True}, ["lldpd installed"])
+    shots.append(("welcome-done", app.render()))
+    app.welcome, app.install, app.perms = False, None, None
     app.demo = dict(app.demo, auth={"count": 3, "age": 12, "last": "Request", "method": None,
                                     "prompt": None, "src": "00:25:84:aa:10:3f", "result": None})
     app.facts = dict(app.facts, ip=None, prefix=None, gw=None)
@@ -1284,6 +1468,8 @@ def main():
     ap.add_argument("--windowed", action="store_true",
                     help="like --window, but a normal-sized window (F11 toggles fullscreen)")
     ap.add_argument("--scale", type=int, help="window scale factor (default: fit the screen)")
+    ap.add_argument("--welcome", action="store_true",
+                    help="show the first-launch permissions pop-up again")
     args = ap.parse_args()
     if args.preview:
         preview(args.preview)
@@ -1309,7 +1495,7 @@ def main():
     shown_at = time.monotonic()
     if kbd is None:
         kbd = Keyboard()
-    app = App()
+    app = App(welcome=args.welcome or not firstrun.seen())
 
     def on_signal(*_):
         app.quit = True
@@ -1329,7 +1515,8 @@ def main():
             radar = (app.screen == 0 and app.facts.get("link", {}).get("up")
                      and not app.neighbor())
             busy = (any(j.running for j in app.jobs.values()) or app.esc_down is not None
-                    or radar or (app.vjoin and app.vjoin.running))
+                    or radar or (app.vjoin and app.vjoin.running)
+                    or (app.install and app.install.running))
             for code, value in kbd.poll(0.08 if busy else 0.25):
                 app.on_key(code, value)
             app.tick()
