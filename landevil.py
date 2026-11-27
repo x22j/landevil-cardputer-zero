@@ -43,7 +43,7 @@ from ui import (AMBER, BG, BLUE, DIM, DKAMBER, DKGREEN, DKRED, FAINT, GREEN, H, 
                 fit, font, keycap, ms, nice, paste_asset, rj45, scrollbar, set_scale, tag,
                 vendor_color, warn_icon)
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SCREENS = ["STAT", "DHCP", "VLAN", "PING", "NET", "ARP", "PORT", "LOG"]
 LONG_PRESS = 0.8
 KEY_S, KEY_X = 31, 45
@@ -1001,8 +1001,9 @@ class App:
         if not job:
             empty(d, "ARP sweep",
                   ["One ARP request to every address in your",
-                   "subnet (capped at a /24), then lists who answered",
-                   f"with MAC and vendor.  Runs on {self.test_iface}."],
+                   "subnet (capped at a /24), paced at 12/s to stay",
+                   "under switch ARP-inspection limits (about 20 s).",
+                   f"Lists who answered, with vendor. On {self.test_iface}."],
                   warn="Active scan · authorized networks only", top=34)
             return
         data = job.data

@@ -867,11 +867,38 @@ def _oui_line(line):
     _OUI.setdefault(key, name.strip())
 
 
+# Dynamic ARP Inspection (Cisco DAI and similar) rate-limits ARP on access
+# ports, 15 packets/s by default, and err-disables the port when it's
+# exceeded. Stay under it: a /24 takes about 21 s instead of under one.
+ARP_PPS = 12
+# Without root the kernel sends the ARPs, and it retries an unanswered
+# address up to 3 times (net.ipv4.neigh.*.mcast_solicit), so poke slower.
+ARP_KERNEL_PPS = 4
+
+
+def _paced(job, n, pps, idle):
+    """Yield 0..n-1 no faster than pps per second; call idle(seconds) while
+    waiting so replies keep being collected. Stops early if the job stops."""
+    gap = 1.0 / pps
+    nxt = time.monotonic()
+    for i in range(n):
+        while True:
+            if job.stop.is_set():
+                return
+            wait = nxt - time.monotonic()
+            if wait <= 0:
+                break
+            idle(min(wait, 0.1))
+        yield i
+        nxt += gap
+
+
 def arp_sweep(job, iface):
     """ARP every address in the local subnet (capped to the /24 around us).
 
-    Same shape as the S31 firmware: paced bursts, then a 2.5 s collection
-    window. job.data: {"net", "total", "sent", "hosts": [(ip, mac, vendor)]}
+    Paced to ARP_PPS (below switch ARP-inspection limits), then a 2.5 s
+    collection window.
+    job.data: {"net", "total", "sent", "hosts": [(ip, mac, vendor)], "pps"}
     """
     d = job.data
     d.update(total=0, sent=0, hosts=[])
@@ -883,8 +910,9 @@ def arp_sweep(job, iface):
     net = ipaddress.IPv4Network(f"{ip}/{max(prefix, 24)}", strict=False)
     targets = [str(h) for h in net.hosts() if str(h) != ip]
     target_set = set(targets)
-    d.update(net=str(net), total=len(targets))
+    d.update(net=str(net), total=len(targets), pps=ARP_PPS)
     if not is_root():
+        d["pps"] = ARP_KERNEL_PPS
         return _arp_sweep_kernel(job, iface, targets)
     my_mac = bytes.fromhex(mac.replace(":", ""))
     my_ip = socket.inet_aton(ip)
@@ -907,17 +935,18 @@ def arp_sweep(job, iface):
                     d["hosts"] = sorted(((k, v, vendor(v)) for k, v in seen.items()),
                                         key=lambda r: ipaddress.IPv4Address(r[0]))
 
+    def idle(sec):
+        select.select([s], [], [], sec)
+        drain()
+
     try:
-        for i, t in enumerate(targets):
-            if job.stop.is_set():
-                return
+        for i in _paced(job, len(targets), ARP_PPS, idle):
             s.send(b"\xff" * 6 + my_mac + b"\x08\x06" +
                    b"\x00\x01\x08\x00\x06\x04\x00\x01" + my_mac + my_ip +
-                   b"\x00" * 6 + socket.inet_aton(t))
+                   b"\x00" * 6 + socket.inet_aton(targets[i]))
             d["sent"] = i + 1
-            if i % 16 == 15:
-                time.sleep(0.03)
-                drain()
+        if job.stop.is_set():
+            return
         deadline = time.monotonic() + 2.5
         while time.monotonic() < deadline and not job.stop.is_set():
             select.select([s], [], [], 0.1)
@@ -951,18 +980,19 @@ def _arp_sweep_kernel(job, iface, targets):
         d["hosts"] = sorted(((k, v, vendor(v)) for k, v in found.items()),
                             key=lambda r: ipaddress.IPv4Address(r[0]))
 
+    def idle(sec):
+        time.sleep(sec)
+        collect()
+
     try:
-        for i, t in enumerate(targets):
-            if job.stop.is_set():
-                return
+        for i in _paced(job, len(targets), ARP_KERNEL_PPS, idle):
             try:
-                s.sendto(b"\0", (t, 9))       # discard port; reply irrelevant
+                s.sendto(b"\0", (targets[i], 9))   # discard port; reply irrelevant
             except OSError:
                 pass
             d["sent"] = i + 1
-            if i % 16 == 15:
-                time.sleep(0.03)
-                collect()
+        if job.stop.is_set():
+            return
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and not job.stop.is_set():
             time.sleep(0.25)
