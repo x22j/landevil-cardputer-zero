@@ -30,7 +30,7 @@ CardputerZero the keyboard and screen are the whole interface.
 | **VLAN** | `S` watches 802.1Q-tagged frames on a trunk (passive): per VLAN frames, hosts, guessed subnet, merged with what the switch advertises (native / voice / named VLANs). `Enter` **joins** the selected (or typed) VLAN: creates `eth0.N`, gets a DHCP lease, and DHCP/Ping/ARP/Port then run on that VLAN (header shows `V30`). `X` leaves (DHCPRELEASE + link removed); exiting the app always cleans up. No default route is added, so Wi-Fi/SSH are unaffected. |
 | **PING** | Live RTT bar graph (lost = red X) + recv/loss/avg/min-max tiles. |
 | **NET** | One key, three answers for the host you type: **DNS** (asks the DNS servers *this port* got from DHCP, not a VPN's resolver), **internet** (`generate_204`: online, **captive portal** with its redirect host, or blocked) and a **traceroute** (UDP probes, no root or `traceroute` package needed). All pinned to the wired port. |
-| **ARP** | Subnet sweep (capped /24) with MAC vendors. |
+| **ARP** | Subnet sweep (capped /24) with MAC vendors. Paced at 12 ARP/s (4/s without root, since the kernel retries) to stay under switch ARP-inspection limits such as Cisco DAI's default 15/s, which err-disables the port; a /24 takes about 20 s. |
 | **PORT** | TCP connect grid of 28 common services. |
 | **LOG** | Every new switch+port is **auto-logged**; type a note ("Rm 214 jack B") + Enter to add a labelled row. CSV at `~/landevil/ports.csv` (owned by the desktop user even though the app runs under sudo). |
 
