@@ -35,6 +35,15 @@
       "background_service": false,
       "external_display": false
     },
-    "locales": {}
+    "locales": {
+      "zh-CN": {
+        "title": "LAN Devil",
+        "summary": "插上交换机端口，即可查看交换机、端口、VLAN 和管理 IP"
+      },
+      "ja": {
+        "title": "LAN Devil",
+        "summary": "スイッチのポートに挿すだけで、スイッチ名・ポート・VLAN・管理IPを表示"
+      }
+    }
   }
 }
